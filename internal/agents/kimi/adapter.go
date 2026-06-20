@@ -91,6 +91,7 @@ func (a *Adapter) findKimi() (string, error) {
 	fallbacks := []string{
 		filepath.Join(home, ".local", "bin", binaryName()),
 		filepath.Join(home, "bin", binaryName()),
+		filepath.Join(home, ".kimi-code", "bin", binaryName()),
 	}
 	if runtime.GOOS == "windows" {
 		fallbacks = append(fallbacks,
@@ -198,20 +199,24 @@ func (a *Adapter) SupportsMCP() bool {
 
 // --- Sub-agent support (optional interface) ---
 //
-// Kimi Code CLI has built-in subagents (coder, explore, plan) that are
-// native to the tool. Gentle AI SDD agents are injected via the AGENTS.md
-// system prompt and skill registry, not via separate YAML specs.
-
+// Kimi Code CLI v0.18.0+ has only three built-in subagents (coder, explore, plan)
+// that are native to the tool. There is no user-defined custom subagent registry
+// in the TypeScript CLI (the legacy Python CLI's LaborMarket/YAML spec system was
+// removed). Gentle AI SDD content is injected via the AGENTS.md system prompt and
+// skill registry, not via separate YAML specs. Therefore SupportsSubAgents MUST
+// remain false — flipping it to true would cause sdd/inject.go and uninstall/service.go
+// to copy the embedded asset root into ~/.kimi-code/agents/, which is catastrophic.
+// Do NOT remove or relax this without a full audit of those call sites.
 func (a *Adapter) SupportsSubAgents() bool {
-	return true
+	return false
 }
 
-func (a *Adapter) SubAgentsDir(homeDir string) string {
-	return filepath.Join(homeDir, ".kimi-code", "agents")
+func (a *Adapter) SubAgentsDir(_ string) string {
+	return ""
 }
 
 func (a *Adapter) EmbeddedSubAgentsDir() string {
-	return "kimi/agents"
+	return ""
 }
 
 func (a *Adapter) PostInstallMessage(homeDir string) string {
