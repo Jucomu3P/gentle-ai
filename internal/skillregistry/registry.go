@@ -279,7 +279,7 @@ func uniqueExistingDirs(dirs []string) []string {
 			continue
 		}
 		seen[clean] = true
-		out = append(out, dir)
+		out = append(out, clean)
 	}
 	return out
 }
