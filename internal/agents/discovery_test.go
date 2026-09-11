@@ -5,9 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
-	"github.com/gentleman-programming/gentle-ai/internal/model"
-	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/agents/capabilitymanifest"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/state"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/system"
 )
 
 // stubAdapter is a minimal Adapter implementation for discovery tests.
@@ -17,11 +20,14 @@ type stubAdapter struct {
 	configDir string // value returned by GlobalConfigDir (may be empty)
 }
 
-func (s stubAdapter) Agent() model.AgentID      { return s.agent }
-func (s stubAdapter) Tier() model.SupportTier   { return model.TierFull }
-func (s stubAdapter) SupportsAutoInstall() bool { return false }
+func (s stubAdapter) Agent() model.AgentID    { return s.agent }
+func (s stubAdapter) Tier() model.SupportTier { return model.TierFull }
+func (s stubAdapter) CapabilityManifest() capabilitymanifest.AgentCapabilityManifest {
+	return capabilitymanifest.MustForAgent(s.agent)
+}
 func (s stubAdapter) Detect(_ context.Context, _ string) (bool, string, string, bool, error) {
-	return false, "", "", false, nil
+	info, err := os.Stat(s.configDir)
+	return false, "", s.configDir, err == nil && info.IsDir(), nil
 }
 func (s stubAdapter) InstallCommand(system.PlatformProfile) ([][]string, error) { return nil, nil }
 
@@ -38,16 +44,28 @@ func (s stubAdapter) SystemPromptStrategy() model.SystemPromptStrategy {
 }
 func (s stubAdapter) MCPStrategy() model.MCPStrategy          { return model.StrategySeparateMCPFiles }
 func (s stubAdapter) MCPConfigPath(_ string, _ string) string { return "" }
-func (s stubAdapter) SupportsOutputStyles() bool              { return false }
-func (s stubAdapter) OutputStyleDir(_ string) string          { return "" }
-func (s stubAdapter) SupportsSlashCommands() bool             { return false }
-func (s stubAdapter) CommandsDir(_ string) string             { return "" }
-func (s stubAdapter) SupportsSubAgents() bool                 { return false }
-func (s stubAdapter) SubAgentsDir(_ string) string            { return "" }
-func (s stubAdapter) EmbeddedSubAgentsDir() string            { return "" }
-func (s stubAdapter) SupportsSkills() bool                    { return true }
-func (s stubAdapter) SupportsSystemPrompt() bool              { return true }
-func (s stubAdapter) SupportsMCP() bool                       { return true }
+func (s stubAdapter) SupportsOutputStyles() bool {
+	return s.CapabilityManifest().Features.OutputStyles
+}
+func (s stubAdapter) OutputStyleDir(_ string) string { return "" }
+func (s stubAdapter) SupportsSlashCommands() bool {
+	return s.CapabilityManifest().Features.SlashCommands
+}
+func (s stubAdapter) CommandsDir(_ string) string { return "" }
+func (s stubAdapter) SupportsSubAgents() bool {
+	return s.CapabilityManifest().Features.FileSubAgents
+}
+func (s stubAdapter) SubAgentsDir(_ string) string { return "" }
+func (s stubAdapter) EmbeddedSubAgentsDir() string { return "" }
+func (s stubAdapter) SupportsSkills() bool {
+	return s.CapabilityManifest().Features.Skills
+}
+func (s stubAdapter) SupportsSystemPrompt() bool {
+	return s.CapabilityManifest().Features.SystemPrompt
+}
+func (s stubAdapter) SupportsMCP() bool {
+	return s.CapabilityManifest().Features.MCP
+}
 
 // newStubRegistry creates a Registry from stub adapters.
 func newStubRegistry(t *testing.T, adapters ...stubAdapter) *Registry {
@@ -320,5 +338,101 @@ func TestConfigRootsForBackup_WithDefaultRegistryCoversCreatedDirs(t *testing.T)
 		if _, ok := rootSet[want]; !ok {
 			t.Errorf("ConfigRootsForBackup() missing %q in roots %v", want, roots)
 		}
+	}
+}
+
+// ─── DiscoverSelected ────────────────────────────────────────────────────
+
+// writeInstalledAgentsState persists an install state listing only ids.
+func writeInstalledAgentsState(t *testing.T, home string, ids ...model.AgentID) {
+	t.Helper()
+	installed := make([]string, 0, len(ids))
+	for _, id := range ids {
+		installed = append(installed, string(id))
+	}
+	if err := state.Write(home, state.InstallState{InstalledAgents: installed}); err != nil {
+		t.Fatalf("state.Write: %v", err)
+	}
+}
+
+// TestDiscoverSelected_HonoursSelectionInBothDirections is the regression test
+// Scope is the intersection: an agent installed but never
+// selected is excluded (the reported bug — Codex and Cursor were rewritten on
+// every sync), and an agent selected but not installed is excluded too, so
+// selection never conjures a config directory that is not there.
+func TestDiscoverSelected_HonoursSelectionInBothDirections(t *testing.T) {
+	home := t.TempDir()
+
+	opencodeDir := filepath.Join(home, ".config", "opencode")
+	codexDir := filepath.Join(home, ".codex")
+	cursorDir := filepath.Join(home, ".cursor")
+	for _, dir := range []string{opencodeDir, codexDir, cursorDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", dir, err)
+		}
+	}
+	// .claude is selected below but deliberately never created on disk.
+	writeInstalledAgentsState(t, home, model.AgentOpenCode, model.AgentClaudeCode)
+
+	reg := newStubRegistry(t,
+		stubAdapter{agent: model.AgentOpenCode, configDir: opencodeDir},
+		stubAdapter{agent: model.AgentCodex, configDir: codexDir},
+		stubAdapter{agent: model.AgentCursor, configDir: cursorDir},
+		stubAdapter{agent: model.AgentClaudeCode, configDir: filepath.Join(home, ".claude")},
+	)
+
+	got := DiscoverSelected(reg, home)
+
+	if len(got) != 1 || got[0].ID != model.AgentOpenCode {
+		t.Fatalf("DiscoverSelected() = %v, want only %q", got, model.AgentOpenCode)
+	}
+}
+
+// TestReadSelectionScope is the semantic matrix shared by every selection
+// consumer. Only an explicit configured-empty selection is authoritative; missing
+// and incidental state retain filesystem fallback, while unreadable state fails
+// closed.
+func TestReadSelectionScope(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name      string
+		state     *state.InstallState
+		malformed bool
+		wantMode  SelectionScopeMode
+		wantIDs   []model.AgentID
+	}{
+		{name: "missing state falls back to filesystem", wantMode: SelectionScopeFilesystemFallback},
+		{name: "unreadable state fails closed", malformed: true, wantMode: SelectionScopeUnavailable},
+		{name: "configured empty selection is authoritative", state: &state.InstallState{SelectionConfigured: true}, wantMode: SelectionScopeConfigured},
+		{name: "cooldown state falls back to filesystem", state: &state.InstallState{LastUpdateCheck: &now}, wantMode: SelectionScopeFilesystemFallback},
+		{name: "non-empty selection is authoritative", state: &state.InstallState{InstalledAgents: []string{"opencode", "codex"}}, wantMode: SelectionScopeConfigured, wantIDs: []model.AgentID{model.AgentOpenCode, model.AgentCodex}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			if tt.malformed {
+				if err := os.MkdirAll(filepath.Dir(state.Path(home)), 0o755); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+				if err := os.WriteFile(state.Path(home), []byte("{not json"), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			} else if tt.state != nil {
+				if err := state.Write(home, *tt.state); err != nil {
+					t.Fatalf("state.Write: %v", err)
+				}
+			}
+
+			got := ReadSelectionScope(home)
+			if got.Mode != tt.wantMode || len(got.AgentIDs) != len(tt.wantIDs) {
+				t.Fatalf("ReadSelectionScope() = %+v, want mode %v and IDs %v", got, tt.wantMode, tt.wantIDs)
+			}
+			for i, want := range tt.wantIDs {
+				if got.AgentIDs[i] != want {
+					t.Errorf("ReadSelectionScope().AgentIDs[%d] = %q, want %q", i, got.AgentIDs[i], want)
+				}
+			}
+		})
 	}
 }

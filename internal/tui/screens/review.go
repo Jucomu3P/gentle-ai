@@ -3,16 +3,18 @@ package screens
 import (
 	"strings"
 
-	"github.com/gentleman-programming/gentle-ai/internal/model"
-	"github.com/gentleman-programming/gentle-ai/internal/planner"
-	"github.com/gentleman-programming/gentle-ai/internal/tui/styles"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/planner"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/tui/styles"
 )
 
 func ReviewOptions() []string {
 	return []string{"Install", "Back"}
 }
 
-func RenderReview(payload planner.ReviewPayload, cursor int) string {
+// RenderReview adds the installer-only, deferred RDD selection to the final
+// confirmation when reviewMode is non-empty.
+func RenderReview(payload planner.ReviewPayload, cursor int, reviewMode string) string {
 	var b strings.Builder
 
 	b.WriteString(styles.TitleStyle.Render("Review and Confirm"))
@@ -21,6 +23,9 @@ func RenderReview(payload planner.ReviewPayload, cursor int) string {
 	b.WriteString("  " + styles.HeadingStyle.Render("Agents") + "  " + styles.UnselectedStyle.Render(joinIDs(payload.Agents)) + "\n")
 	b.WriteString("  " + styles.HeadingStyle.Render("Persona") + "  " + styles.UnselectedStyle.Render(reviewPersonaLabel(payload.Persona)) + "\n")
 	b.WriteString("  " + styles.HeadingStyle.Render("Preset") + "  " + styles.UnselectedStyle.Render(reviewPresetLabel(payload.Preset)) + "\n")
+	if reviewMode != "" {
+		b.WriteString("  " + styles.HeadingStyle.Render("Receipt-Driven Development") + "  " + styles.UnselectedStyle.Render(reviewMode) + "\n")
+	}
 	b.WriteString("\n")
 
 	if len(payload.Components) > 0 {
@@ -86,14 +91,17 @@ func joinIDs[T ~string](values []T) string {
 }
 
 func reviewPersonaLabel(persona model.PersonaID) string {
-	switch persona {
-	case model.PersonaCustom:
+	if persona == model.PersonaCustom {
 		return "keep existing persona unmanaged"
-	case model.PersonaGentlemanNeutralArtifacts:
-		return "Gentleman conversation, neutral artifacts"
-	default:
-		return string(persona)
 	}
+	// Keep the persona ID visible: this is the confirm-before-write screen, so
+	// the reader must be able to see the exact value that lands in state.json,
+	// not only its prose description. The two Gentleman variants differ solely
+	// by the "(legacy alias)" suffix, which is too easy to miss on its own.
+	if description, ok := personaDescriptions[persona]; ok {
+		return string(persona) + " — " + description
+	}
+	return string(persona)
 }
 
 func reviewPresetLabel(preset model.PresetID) string {

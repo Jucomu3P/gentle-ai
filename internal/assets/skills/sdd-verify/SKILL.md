@@ -11,23 +11,20 @@ metadata:
   delegate_only: true
 ---
 
-> **ORCHESTRATOR GATE**: If you loaded this skill via the `skill()` tool, you are
-> the ORCHESTRATOR — STOP. Do NOT execute these instructions inline. Delegate to
-> the dedicated `sdd-verify` sub-agent using your platform's delegation primitive
-> (e.g., `task(...)`, sub-agent invocation, etc.). This skill is for EXECUTORS
-> only.
+## Execution Role
 
-## Executor Override
+Confirm your role before acting. You are the dedicated `sdd-verify` sub-agent unless you loaded this skill directly through the `skill()` tool.
 
-If you ARE the `sdd-verify` sub-agent (NOT the orchestrator), the gate above does NOT apply to you. Continue with the phase work below. Do NOT delegate. Do NOT call the Skill tool. You are the executor — execute.
+- If you are the `sdd-verify` sub-agent, continue with the phase work below. Do not delegate. Do not call the Skill tool.
+- If you loaded this skill through the `skill()` tool, you are the orchestrator. Stop here and delegate to the dedicated `sdd-verify` sub-agent using your platform's delegation primitive (for example, `task(...)` or a sub-agent invocation).
 
 ## Language Domain Contract
 
 Generated technical artifacts default to English. Do not inherit the user's conversational language or the active persona's regional voice for SDD artifacts unless the user explicitly requests that artifact language or the project convention requires it.
 
-If Spanish technical artifacts are explicitly requested, use neutral/professional Spanish unless the user explicitly asks for a regional variant.
+If technical artifacts are explicitly requested in another language, use a neutral/professional register unless the user explicitly requests a different tone or regional variant.
 
-Public/contextual comments follow the target context language by default. Explicit user language or tone overrides win; Spanish comments default to neutral/professional Spanish unless the user or target context clearly calls for regional tone.
+Public/contextual comments follow the target context language by default. Explicit user language or tone overrides win; otherwise use a neutral/professional register unless the target context clearly calls for another tone or regional variant.
 
 ## Activation Contract
 
@@ -38,13 +35,28 @@ The orchestrator should provide structured status from `skills/_shared/sdd-statu
 ## Hard Rules
 
 - Read all available status `contextFiles` before judging implementation. Full spec-driven verification reads proposal, specs, design, and tasks; partial artifact sets degrade as described below.
+- Run full verification only after all tasks are complete. If any task is pending, return `blocked` without running the full suite.
 - Execute relevant tests; static analysis alone is never verification.
 - A spec scenario is compliant only when a covering test passed at runtime.
 - Compare specs first, design second, task completion third.
 - Do not fix issues; report them for the orchestrator/user.
+- Build the complete report as exact candidate bytes, then run `gentle-ai sdd-verify-validate` with authoritative spec counts before any OpenSpec or Engram write. If the validator is unavailable or denies admission, make zero writes and leave the prior report untouched; otherwise persist the same bytes, including a valid `fail`.
+- The report's first non-empty line must be ```` ```yaml ```` (```` ```yml ```` and any letter case are admitted) and the envelope closes with ```` ``` ````; a leading UTF-8 BOM is tolerated, but front matter, `~~~` fences, untagged fences, and any content before the fence are refused.
 - Persist `verify-report` according to mode: Engram, openspec file, hybrid both, or inline-only for `none`.
+- For the final OpenSpec `verify` work unit, persist the canonical passing `openspec/changes/{change}/verify-report.md` before settlement. Native settlement reads, strictly admits, and immutably attests the exact report bytes and resulting candidate tree; never provide a caller digest.
 - If Strict TDD is active, load `strict-tdd-verify.md` from this skill directory; if inactive, never load it.
+- Apply any `rules.verify` from `openspec/config.yaml`
 - Return the Section D envelope from `../_shared/sdd-phase-common.md`.
+- Count the actual requirements and scenarios from the retrieved specs; never invent envelope totals.
+- Native status counts only `### Requirement:` / `### REQ-<n>:` and `#### Scenario:` headings. If the envelope totals differ from that count, status keeps `verify: ready` and names the mismatch in `blockedReasons`; fix the totals and re-verify instead of re-validating the same envelope.
+- Record current test/build commands, exit codes, and `test_output_hash` / `build_output_hash` values in the strict envelope.
+- Model/provider/profile/effort selection remains user-owned and is never changed by verification.
+- This is the one independent requirements/runtime final verification. A contradiction or new failing check returns FAIL/escalation; it never starts 4R, Judgment Day, a refuter, another correction, or scoped validation.
+- Review state is informational and never a verification prerequisite.
+- A missing, pending, invalid, or non-allow review state never suppresses tests or builds.
+- Native review artifacts, when present, are review-context evidence only. Do not require a transaction, policy, ledger, receipt, bundle, or gate-context artifact to begin or complete independent SDD verification.
+- Exit `125` is reserved for an actual verification prerequisite or unavailable verification tooling, never missing review authority.
+- Return ordinary verification evidence with the result. Terminal reviewer closure is capture-owned and informational; it is never a verification completion prerequisite.
 
 ## Decision Gates
 
@@ -67,7 +79,7 @@ The orchestrator should provide structured status from `skills/_shared/sdd-statu
 1. Load relevant skills via shared SDD Section A.
 2. Retrieve artifacts via shared Section B for the active persistence mode, or read the concrete `contextFiles` from structured status.
 3. Resolve testing/TDD mode from cached capabilities, config, or project files.
-4. Count completed and incomplete tasks. Any unchecked implementation task is CRITICAL and blocks archive readiness.
+4. Count completed and incomplete tasks. Any unchecked task blocks full verification; focused checks remain an apply work-unit responsibility.
 5. If specs exist, map each spec requirement/scenario to implementation evidence and tests.
 6. If design exists, check design decisions against changed code. If design is missing, skip design coherence and record why.
 7. Run test, build/type-check, and coverage commands when available. For full spec verification, preserve gentle-ai's stricter runtime evidence: source inspection alone does not prove spec scenario compliance.
@@ -112,9 +124,9 @@ metadata:
 
 Generated technical artifacts default to English. Do not inherit the user's conversational language or the active persona's regional voice for SDD artifacts unless the user explicitly requests that artifact language or the project convention requires it.
 
-If Spanish technical artifacts are explicitly requested, use neutral/professional Spanish unless the user explicitly asks for a regional variant.
+If technical artifacts are explicitly requested in another language, use a neutral/professional register unless the user explicitly requests a different tone or regional variant.
 
-Public/contextual comments follow the target context language by default. Explicit user language or tone overrides win; Spanish comments default to neutral/professional Spanish unless the user or target context clearly calls for regional tone.
+Public/contextual comments follow the target context language by default. Explicit user language or tone overrides win; otherwise use a neutral/professional register unless the target context clearly calls for another tone or regional variant.
 
 ## Purpose
 
@@ -123,10 +135,22 @@ You are a VERIFY sub-agent. Your job: check implemented changes match spec accep
 ## Hard Rules
 
 - Read spec acceptance criteria only
+- Count actual requirements and scenarios from the spec instead of copying example totals.
 - Inspect changed files listed in apply-progress (or tasks) — limit to those files
 - Use structured status when provided; stop on workspace-planning action context
-- Do NOT run tests unless `strict_tdd` is active and test runner is explicitly provided
+- Run the provided test and build/type-check commands even when `strict_tdd` is inactive; verification requires current evidence.
+- Include command, exit code, `test_output_hash`, and `build_output_hash` fields in the strict result envelope.
+- Preserve user-owned model/provider/profile/effort selection; do not prescribe or override it.
 - Do not fix issues; report them for the orchestrator/user
+- A contradiction or failing check escalates; never start another review/fix loop.
+- Review state is informational and never a verification prerequisite.
+- A missing, pending, invalid, or non-allow review state never suppresses tests or builds.
+- Do not require a review transaction, policy, ledger, receipt, bundle, or gate context to begin or complete independent SDD verification.
+- Exit `125` is reserved for an actual verification prerequisite or unavailable verification tooling, never missing review authority.
+- Return ordinary verification evidence with the result. Terminal reviewer closure remains capture-owned and informational.
+- Build the complete report as exact candidate bytes, then run `gentle-ai sdd-verify-validate` with authoritative spec counts before any OpenSpec or Engram write. If the validator is unavailable or denies admission, make zero writes and leave the prior report untouched; otherwise persist the same bytes, including a valid `fail`.
+- For the final OpenSpec `verify` work unit, persist the canonical passing `openspec/changes/{change}/verify-report.md` before settlement. Native settlement reads, strictly admits, and immutably attests the exact report bytes and resulting candidate tree; never provide a caller digest.
+- Apply any `rules.verify` from `openspec/config.yaml`
 - Return minimal report
 
 ## Return Minimal Report

@@ -3,7 +3,7 @@ package skills
 import (
 	"testing"
 
-	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
 )
 
 func TestSkillsForPresetMinimalReturnsSDDOnly(t *testing.T) {
@@ -82,6 +82,8 @@ func TestAllSkillIDsIncludesEveryKnownSkill(t *testing.T) {
 		model.SkillJudgmentDay,
 		model.SkillImprover,
 		model.SkillGoTesting,
+		model.SkillSystemicIssueTriage,
+		model.SkillGentleAIBench,
 	}
 
 	skillSet := make(map[model.SkillID]struct{}, len(all))
@@ -105,6 +107,9 @@ func TestRequestedBundledSkillsAreInPresetSkillSets(t *testing.T) {
 		model.SkillJudgmentDay,
 		model.SkillSDDInit,
 		model.SkillImprover,
+		model.SkillRDDDefectWorkflow,
+		model.SkillSystemicIssueTriage,
+		model.SkillGentleAIBench,
 	}
 
 	for _, preset := range []model.PresetID{model.PresetEcosystemOnly, model.PresetFullGentleman} {

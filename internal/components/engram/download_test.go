@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,8 +18,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/system"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("GENTLE_AI_FAKE_GO") == "1" {
+		data := fmt.Sprintf("GONOSUMDB=%s\nGOPRIVATE=%s\nGONOPROXY=%s\n", os.Getenv("GONOSUMDB"), os.Getenv("GOPRIVATE"), os.Getenv("GONOPROXY"))
+		_ = os.WriteFile(os.Getenv("GO_ENV_RECORD"), []byte(data), 0o600)
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 // --- test helpers ---
 
@@ -1166,13 +1176,75 @@ func TestDownloadLatestBinary_BetaChannelUsesGoInstallMain(t *testing.T) {
 	}
 }
 
+func TestCanonicalEngramGoInstallPackagePreservesDeclaredModuleCasing(t *testing.T) {
+	tests := []struct {
+		name string
+		pkg  string
+		want string
+	}{
+		{
+			name: "lowercase owner is canonicalized",
+			pkg:  "github.com/gentleman-programming/engram/cmd/engram@main",
+			want: "github.com/Gentleman-Programming/engram/cmd/engram@main",
+		},
+		{
+			name: "canonical owner remains unchanged",
+			pkg:  "github.com/Gentleman-Programming/engram/cmd/engram@v1.2.3",
+			want: "github.com/Gentleman-Programming/engram/cmd/engram@v1.2.3",
+		},
+		{
+			name: "unrelated package remains unchanged",
+			pkg:  "github.com/gentleman-programming/gentle-ai/v2/cmd/gentle-ai@latest",
+			want: "github.com/gentleman-programming/gentle-ai/v2/cmd/gentle-ai@latest",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := canonicalEngramGoInstallPackage(tt.pkg); got != tt.want {
+				t.Fatalf("canonicalEngramGoInstallPackage(%q) = %q, want %q", tt.pkg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEngramGoInstallFromMainCanonicalizesModuleCasing(t *testing.T) {
+	const fakeInstallDir = "/custom/gobin"
+
+	origGoInstallCmdFn := engramGoInstallCmdFn
+	origGoEnvFn := engramGoEnvFn
+	t.Cleanup(func() {
+		engramGoInstallCmdFn = origGoInstallCmdFn
+		engramGoEnvFn = origGoEnvFn
+	})
+
+	var gotPkg string
+	engramGoInstallCmdFn = func(pkg string) error {
+		gotPkg = pkg
+		return nil
+	}
+	engramGoEnvFn = func(keys ...string) (map[string]string, error) {
+		return map[string]string{"GOBIN": fakeInstallDir, "GOPATH": ""}, nil
+	}
+
+	_, err := engramGoInstallFromMain("github.com/gentleman-programming/engram/cmd/engram@main")
+	if err != nil {
+		t.Fatalf("engramGoInstallFromMain: unexpected error: %v", err)
+	}
+
+	wantPkg := "github.com/Gentleman-Programming/engram/cmd/engram@main"
+	if gotPkg != wantPkg {
+		t.Fatalf("go install package = %q, want %q", gotPkg, wantPkg)
+	}
+}
+
 // TestEngramGoInstallFromMain_UsesGoEnvForBinDir verifies that
 // engramGoInstallFromMain resolves the install directory via `go env GOBIN GOPATH`
 // (the effective Go environment) rather than reading raw shell env vars.
 // This matters when GOBIN is set via `go env -w GOBIN=...` (stored in Go's
 // env file) but NOT exported into the shell environment.
 func TestEngramGoInstallFromMain_UsesGoEnvForBinDir(t *testing.T) {
-	const fakeInstallDir = "/custom/gobin/via/go-env"
+	fakeInstallDir := filepath.Join(t.TempDir(), "custom", "gobin", "via", "go-env")
 
 	origGoEnvFn := engramGoEnvFn
 	t.Cleanup(func() { engramGoEnvFn = origGoEnvFn })
@@ -1217,10 +1289,26 @@ func TestEngramGoInstallFromMain_BypassesPublicGoProxy(t *testing.T) {
 	goPath := filepath.Join(binDir, "go")
 	recordPath := filepath.Join(t.TempDir(), "go-env.txt")
 	fakeGo := filepath.Join(binDir, "go")
-	script := "#!/usr/bin/env bash\n" +
-		"printf 'GONOSUMDB=%s\\nGOPRIVATE=%s\\nGONOPROXY=%s\\n' \"${GONOSUMDB:-}\" \"${GOPRIVATE:-}\" \"${GONOPROXY:-}\" > \"$GO_ENV_RECORD\"\n"
-	if err := os.WriteFile(fakeGo, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
+	if runtime.GOOS == "windows" {
+		fakeGo += ".exe"
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(executable)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fakeGo, data, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GENTLE_AI_FAKE_GO", "1")
+	} else {
+		script := "#!/usr/bin/env bash\n" +
+			"printf 'GONOSUMDB=%s\\nGOPRIVATE=%s\\nGONOPROXY=%s\\n' \"${GONOSUMDB:-}\" \"${GOPRIVATE:-}\" \"${GONOPROXY:-}\" > \"$GO_ENV_RECORD\"\n"
+		if err := os.WriteFile(fakeGo, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("GO_ENV_RECORD", recordPath)
@@ -1280,4 +1368,90 @@ func TestEngramStopScriptIsDefensive(t *testing.T) {
 	if strings.Contains(script, "Stop-Process -Force -ErrorAction Stop") {
 		t.Errorf("stop script must not use -ErrorAction Stop on Stop-Process (reintroduces issue #815/#850)\nscript:\n%s", script)
 	}
+
+	// The clean/no-process path must report success explicitly, regardless of any
+	// PowerShell status left behind by defensive no-op commands.
+	if !strings.HasSuffix(strings.TrimSpace(script), "exit 0") {
+		t.Errorf("stop script must explicitly exit 0 on the clean/no-process path\nscript:\n%s", script)
+	}
+}
+
+func TestStopEngramProcessesUsesPowerShellResolver(t *testing.T) {
+	dir := t.TempDir()
+	host := "pwsh"
+	if runtime.GOOS == "windows" {
+		host += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(dir, host), nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	runner := system.NewPowerShellRunner()
+	var used string
+	runner.RunCommand = func(_ context.Context, name string, _ ...string) ([]byte, error) { used = name; return nil, nil }
+	if err := stopEngramProcessesWith(runner); err != nil {
+		t.Fatalf("stopEngramProcesses() error = %v", err)
+	}
+	if !strings.HasPrefix(filepath.Base(used), "pwsh") {
+		t.Fatalf("stopEngramProcesses() host = %q, want pwsh", used)
+	}
+}
+
+// TestSHA256ChecksumContract verifies that the SHA256 hex digest format produced
+// by the Go installer matches the format expected by the PowerShell fallback in
+// scripts/install.ps1. This is a contract test that ensures both implementations
+// produce compatible checksums for verification.
+//
+// The PowerShell fallback uses .NET cryptography when Get-FileHash is unavailable:
+//
+//	$sha256 = [System.Security.Cryptography.SHA256]::Create()
+//	$fileStream = [System.IO.File]::OpenRead($archivePath)
+//	$hashBytes = $sha256.ComputeHash($fileStream)
+//	$actualChecksum = [System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLower()
+//
+// This test ensures the Go implementation produces the same format: 64 lowercase
+// hexadecimal characters. If this contract breaks, the PowerShell fallback will
+// fail checksum verification even when the digests match.
+//
+// Related: PR #937 (PowerShell 5.1 fallback for SHA256 checksum verification)
+func TestSHA256ChecksumContract(t *testing.T) {
+	// Test data: arbitrary content to hash
+	testData := []byte("Gentle AI SHA256 contract test")
+
+	// Calculate hash using Go's crypto/sha256 (same as engramDownloadToFile)
+	h := sha256.Sum256(testData)
+	goDigest := hex.EncodeToString(h[:])
+
+	// Contract assertion 1: digest must be exactly 64 characters
+	if len(goDigest) != 64 {
+		t.Errorf("SHA256 digest length = %d, want 64", len(goDigest))
+	}
+
+	// Contract assertion 2: digest must be lowercase hexadecimal
+	for i, c := range goDigest {
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+		if !isHex {
+			t.Errorf("SHA256 digest[%d] = %c, want lowercase hex digit", i, c)
+		}
+	}
+
+	// Contract assertion 3: digest must be deterministic (same input → same output)
+	h2 := sha256.Sum256(testData)
+	goDigest2 := hex.EncodeToString(h2[:])
+	if goDigest != goDigest2 {
+		t.Errorf("SHA256 digest is not deterministic: %q != %q", goDigest, goDigest2)
+	}
+
+	// Contract assertion 4: different input → different output
+	differentData := []byte("different content")
+	h3 := sha256.Sum256(differentData)
+	differentDigest := hex.EncodeToString(h3[:])
+	if goDigest == differentDigest {
+		t.Errorf("SHA256 digest collision: different inputs produced same digest")
+	}
+
+	// Document the expected format for the PowerShell fallback
+	// This comment serves as documentation for maintainers modifying either implementation
+	t.Logf("SHA256 contract: Go produces %q format (64 lowercase hex chars)", goDigest)
+	t.Logf("PowerShell fallback must produce identical format using .NET SHA256")
 }

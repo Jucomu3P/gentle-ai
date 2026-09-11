@@ -5,8 +5,6 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,13 +17,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/components/filemerge"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/system"
 )
 
 const (
-	engramOwner = "Gentleman-Programming"
-	engramRepo  = "engram"
-	engramName  = "engram"
+	engramOwner            = "Gentleman-Programming"
+	engramRepo             = "engram"
+	engramName             = "engram"
+	engramCanonicalModule  = "github.com/Gentleman-Programming/engram"
+	engramCanonicalPackage = engramCanonicalModule + "/cmd/engram"
 )
 
 // Package-level vars for testability.
@@ -43,7 +44,7 @@ var (
 	// engramGoInstallCmdFn executes `go install <pkg>`. Package-level var for testability.
 	engramGoInstallCmdFn = func(pkg string) error {
 		cmd := exec.Command("go", "install", pkg)
-		cmd.Env = goPrivateModuleEnv(os.Environ(), "github.com/Gentleman-Programming/engram")
+		cmd.Env = goPrivateModuleEnv(os.Environ(), engramCanonicalModule)
 		cmd.Stdin = nil
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -110,6 +111,14 @@ func appendGoEnvPattern(required, existing string) string {
 	return existing + "," + required
 }
 
+func canonicalEngramGoInstallPackage(pkg string) string {
+	const lowerPackage = "github.com/gentleman-programming/engram/cmd/engram"
+	if strings.HasPrefix(strings.ToLower(pkg), lowerPackage) {
+		return engramCanonicalPackage + pkg[len(lowerPackage):]
+	}
+	return pkg
+}
+
 // engramCoreTagPattern matches only plain semver tags (vX.Y.Z) that identify
 // core engram binary releases. The Gentleman-Programming/engram repository also
 // publishes gentle-engram npm and pi releases under tags like
@@ -137,8 +146,7 @@ func DownloadLatestBinary(profile system.PlatformProfile, isBeta bool) (string, 
 	// Beta channel: install from HEAD via go install rather than a release archive.
 	// This mirrors the installBetaEngramFromMain path used at install time.
 	if isBeta {
-		const pkg = "github.com/Gentleman-Programming/engram/cmd/engram@main"
-		return engramGoInstallFn(pkg)
+		return engramGoInstallFn(engramCanonicalPackage + "@main")
 	}
 
 	ctx := context.Background()
@@ -485,8 +493,13 @@ func engramChecksumURL(baseURL, version string) string {
 		baseURL, engramOwner, engramRepo, version)
 }
 
-// engramDownloadToFile downloads the resource at url to outPath and returns
-// the SHA256 hex digest of the downloaded content.
+// engramDownloadToFile downloads the resource at url to outPath and returns the
+// SHA256 hex digest of the bytes that landed there.
+//
+// The digest is read back from outPath, not accumulated from the response body.
+// A digest taken from the stream certifies its own copy: it matched the release
+// manifest even when a write-back failure left the archive incomplete on disk,
+// so verification confirmed corruption instead of catching it (#1998).
 func engramDownloadToFile(ctx context.Context, url string, outPath string) (hexDigest string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -502,21 +515,16 @@ func engramDownloadToFile(ctx context.Context, url string, outPath string) (hexD
 		return "", fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
 
+	// Create the parent at 0755 explicitly: the writer's own parent creation is
+	// tuned for private config files, and a download directory on PATH is not one.
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return "", fmt.Errorf("create dir: %w", err)
 	}
-	f, err := os.Create(outPath)
+	result, err := filemerge.WriteStreamAtomic(outPath, resp.Body, 0o644)
 	if err != nil {
-		return "", fmt.Errorf("create %s: %w", outPath, err)
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
 		return "", fmt.Errorf("write %s: %w", outPath, err)
 	}
-
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return result.Digest, nil
 }
 
 // engramFetchChecksums downloads checksums.txt from url and returns its content.
@@ -605,27 +613,30 @@ if ($procs) {
         Write-Output "WARNING: $($remaining.Count) engram process(es) could not be stopped (access denied or still running). The upgrade may fail if the file is still locked."
     }
 }
+exit 0
 `
 }
 
 // stopEngramProcesses runs the defensive stop script (see engramStopScript) and
-// returns a non-nil error only when powershell.exe itself fails to launch or
+// returns a non-nil error only when PowerShell fails to launch or
 // exits non-zero. A WARNING line (processes found but not all stopped) is
 // surfaced to stderr but is treated as non-fatal.
 func stopEngramProcesses() error {
-	cmd := exec.Command("powershell.exe",
+	return stopEngramProcessesWith(system.NewPowerShellRunner())
+}
+
+func stopEngramProcessesWith(runner system.PowerShellRunner) error {
+	out, err := runner.Run(context.Background(),
 		"-NoProfile",
 		"-NonInteractive",
 		"-Command",
 		engramStopScript(),
 	)
-	cmd.Stdin = nil
-	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// powershell itself failed to launch or returned non-zero despite
+		// PowerShell failed to launch or returned non-zero despite
 		// our SilentlyContinue guards — surface the raw output so the user
 		// has something actionable.
-		return fmt.Errorf("powershell Stop-Process engram: %w (output: %s)", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("PowerShell Stop-Process engram: %w", err)
 	}
 	// If the script emitted a WARNING line, surface it but do not fail.
 	// The caller decides whether to abort based on the returned error being nil.
@@ -790,7 +801,7 @@ func (b *byteReaderAt) ReadAt(p []byte, off int64) (int, error) {
 }
 
 // engramGoInstallFromMain installs engram from the given Go package path (expected
-// to be "github.com/Gentleman-Programming/engram/cmd/engram@main") using `go install`.
+// to be engramCanonicalPackage + "@main") using `go install`.
 // It returns the path to the installed binary. This is the beta-channel upgrade path.
 //
 // The install directory is resolved via `go env GOBIN GOPATH` (the effective Go
@@ -798,6 +809,7 @@ func (b *byteReaderAt) ReadAt(p []byte, off int64) (int, error) {
 // file, NOT in shell env) are honored correctly. This mirrors the resolution done
 // by goInstallBinDirFromGoEnv in internal/cli/run.go.
 func engramGoInstallFromMain(pkg string) (string, error) {
+	pkg = canonicalEngramGoInstallPackage(pkg)
 	if err := engramGoInstallCmdFn(pkg); err != nil {
 		return "", err
 	}
@@ -826,51 +838,21 @@ func engramGoInstallFromMain(pkg string) (string, error) {
 	return filepath.Join(gobin, binaryName), nil
 }
 
-// writeExecutable writes the content from r to outPath with executable permissions.
 // writeExecutable writes a binary to outPath using an atomic rename to avoid
 // ETXTBSY ("text file busy") errors on Linux when the target binary is
 // currently running (e.g. engram as an MCP server). The rename trick works
 // because os.Rename replaces the directory entry — the running process keeps
 // its open file descriptor to the old inode, while new executions pick up
 // the new binary.
+//
+// The staged file is synchronized before publication, so if recovery preserves
+// the new name it also preserves complete content (#2216).
 func writeExecutable(r io.Reader, outPath string) error {
-	dir := filepath.Dir(outPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return fmt.Errorf("create parent dir: %w", err)
 	}
-
-	// Write to a temp file in the same directory so Rename is always
-	// same-filesystem (atomic on POSIX).
-	tmp, err := os.CreateTemp(dir, ".engram-upgrade-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+	if _, err := filemerge.WriteStreamAtomic(outPath, r, 0o755); err != nil {
+		return fmt.Errorf("write %s: %w", outPath, err)
 	}
-	tmpPath := tmp.Name()
-
-	// Clean up on any failure path.
-	defer func() {
-		if tmpPath != "" {
-			os.Remove(tmpPath)
-		}
-	}()
-
-	if _, err := io.Copy(tmp, r); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write %s: %w", tmpPath, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-
-	if err := os.Chmod(tmpPath, 0o755); err != nil {
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, outPath); err != nil {
-		return fmt.Errorf("rename %s -> %s: %w", tmpPath, outPath, err)
-	}
-
-	// Rename succeeded — disarm the deferred cleanup.
-	tmpPath = ""
 	return nil
 }

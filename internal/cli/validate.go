@@ -2,11 +2,14 @@ package cli
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"sort"
 	"strings"
 
-	"github.com/gentleman-programming/gentle-ai/internal/catalog"
-	"github.com/gentleman-programming/gentle-ai/internal/model"
-	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/catalog"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/system"
 )
 
 type InstallInput struct {
@@ -21,13 +24,20 @@ func NormalizeInstallFlags(flags InstallFlags, detection system.DetectionResult)
 
 	agents := defaultAgentsFromDetection(detection)
 	if len(flags.Agents) > 0 {
-		agents = asAgentIDs(flags.Agents)
+		parsed, err := asAgentIDs(flags.Agents)
+		if err != nil {
+			return InstallInput{}, err
+		}
+		agents = parsed
 	}
 	selection.Agents = unique(agents)
 
-	persona, err := normalizePersona(flags.Persona)
+	persona, personaRemapped, err := normalizePersona(flags.Persona)
 	if err != nil {
 		return InstallInput{}, err
+	}
+	if personaRemapped {
+		fmt.Fprintln(personaNoticeWriter, personaAliasRemapNotice)
 	}
 	selection.Persona = persona
 
@@ -72,16 +82,29 @@ func NormalizeInstallFlags(flags InstallFlags, detection system.DetectionResult)
 	return InstallInput{Selection: selection, Scope: scope, Channel: channel, DryRun: flags.DryRun}, nil
 }
 
-func normalizePersona(value string) (model.PersonaID, error) {
+// personaAliasRemapNotice is printed whenever the legacy
+// gentleman-neutral-artifacts alias is remapped to the neutral persona.
+const personaAliasRemapNotice = `"gentleman-neutral-artifacts" now maps to "neutral". For a voseo conversation use --persona gentleman.`
+
+// personaNoticeWriter is swappable in tests.
+var personaNoticeWriter io.Writer = os.Stderr
+
+// normalizePersona resolves a --persona flag or persisted state value.
+// The second return is true when the legacy gentleman-neutral-artifacts
+// alias was remapped to neutral: its name promised a neutral tone, so the
+// name now wins; users who want voseo have --persona gentleman.
+func normalizePersona(value string) (model.PersonaID, bool, error) {
 	if strings.TrimSpace(value) == "" {
-		return model.PersonaGentleman, nil
+		return model.PersonaGentleman, false, nil
 	}
 
 	switch model.PersonaID(value) {
-	case model.PersonaGentleman, model.PersonaGentlemanNeutralArtifacts, model.PersonaNeutral, model.PersonaCustom:
-		return model.PersonaID(value), nil
+	case model.PersonaGentlemanNeutralArtifacts:
+		return model.PersonaNeutral, true, nil
+	case model.PersonaGentleman, model.PersonaNeutral, model.PersonaCustom:
+		return model.PersonaID(value), false, nil
 	default:
-		return "", fmt.Errorf("unsupported persona %q", value)
+		return "", false, fmt.Errorf("unsupported persona %q", value)
 	}
 }
 
@@ -156,30 +179,7 @@ func normalizeSDDMode(value string) (model.SDDModeID, error) {
 }
 
 func componentsForPreset(preset model.PresetID, persona model.PersonaID) []model.ComponentID {
-	var components []model.ComponentID
-	switch preset {
-	case model.PresetMinimal:
-		components = []model.ComponentID{model.ComponentEngram}
-	case model.PresetEcosystemOnly:
-		components = []model.ComponentID{model.ComponentEngram, model.ComponentSDD, model.ComponentSkills, model.ComponentContext7, model.ComponentGGA}
-	case model.PresetCustom:
-		return nil
-	default: // full-gentleman
-		components = []model.ComponentID{
-			model.ComponentEngram,
-			model.ComponentSDD,
-			model.ComponentSkills,
-			model.ComponentContext7,
-			model.ComponentPermission,
-			model.ComponentGGA,
-			model.ComponentClaudeTheme,
-			model.ComponentOpenCodeGentleLogo,
-		}
-	}
-	if persona != model.PersonaCustom {
-		components = append(components, model.ComponentPersona)
-	}
-	return components
+	return model.ComponentsForPreset(preset, persona)
 }
 
 func defaultAgentsFromDetection(detection system.DetectionResult) []model.AgentID {
@@ -238,13 +238,34 @@ func defaultAgentsFromDetection(detection system.DetectionResult) []model.AgentI
 	return agents
 }
 
-func asAgentIDs(values []string) []model.AgentID {
+// asAgentIDs converts raw --agent/--agents flag values into model.AgentID,
+// rejecting any value that is not a real, supported agent. The valid set is
+// derived from catalog.AllAgents() -- the same canonical agent registry used
+// by internal/app/app.go's default agent list -- so it can never drift from
+// a hand-written list (install/sync surface audit finding 3: an unknown
+// value like `cluade` previously converted silently and was later dropped
+// without any error, so `gentle-ai sync --agent cluade` reported success
+// having synced nothing).
+func asAgentIDs(values []string) ([]model.AgentID, error) {
+	supported := catalog.AllAgents()
+	allowed := make(map[model.AgentID]struct{}, len(supported))
+	names := make([]string, 0, len(supported))
+	for _, agent := range supported {
+		allowed[agent.ID] = struct{}{}
+		names = append(names, string(agent.ID))
+	}
+	sort.Strings(names)
+
 	agents := make([]model.AgentID, 0, len(values))
 	for _, value := range values {
-		agents = append(agents, model.AgentID(value))
+		id := model.AgentID(value)
+		if _, ok := allowed[id]; !ok {
+			return nil, fmt.Errorf("unsupported agent %q (valid: %s)", value, strings.Join(names, ", "))
+		}
+		agents = append(agents, id)
 	}
 
-	return agents
+	return agents, nil
 }
 
 func isPiOnlyAgents(agents []model.AgentID) bool {
@@ -252,7 +273,7 @@ func isPiOnlyAgents(agents []model.AgentID) bool {
 }
 
 func piOnlyComponents() []model.ComponentID {
-	return []model.ComponentID{model.ComponentEngram}
+	return []model.ComponentID{model.ComponentEngram, model.ComponentPersona}
 }
 
 func unique[T comparable](items []T) []T {

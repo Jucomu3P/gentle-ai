@@ -1,0 +1,327 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gentleman-programming/gentle-ai/v2/internal/reviewtransaction"
+)
+
+func TestFlatReviewStartRejectsBeforeCreatingLegacyAuthority(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	policy := filepath.Join(t.TempDir(), "policy.md")
+	mirror := filepath.Join(t.TempDir(), "transaction.json")
+	if err := os.WriteFile(policy, []byte("legacy policy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := RunReviewStart([]string{
+		"--cwd", repo, "--lineage", "flat-start-read-only", "--policy-file", policy,
+		"--machine-transaction-out", mirror,
+	}, io.Discard)
+	if !errors.Is(err, reviewtransaction.ErrLegacyReadOnly) || !strings.Contains(err.Error(), "gentle-ai review start") {
+		t.Fatalf("flat review-start error = %v", err)
+	}
+	store, storeErr := reviewtransaction.AuthoritativeStore(context.Background(), repo, "flat-start-read-only")
+	if storeErr != nil {
+		t.Fatal(storeErr)
+	}
+	if _, err := store.LoadChain(); !os.IsNotExist(err) {
+		t.Fatalf("flat review-start created v1 authority: %v", err)
+	}
+	if _, err := os.Stat(mirror); !os.IsNotExist(err) {
+		t.Fatalf("flat review-start created mirror: %v", err)
+	}
+}
+
+func TestLegacyV1MutationCommandsRejectWithoutChangingHead(t *testing.T) {
+	fixture := newLegacyCLIFixture(t, "legacy-mutation-rejected")
+	headPath := filepath.Join(fixture.store.Dir, "HEAD")
+	before, err := os.ReadFile(headPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(t.TempDir(), "input.json")
+	if err := os.WriteFile(input, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = RunReviewStep([]string{
+		"--cwd", fixture.repo, "--lineage", fixture.lineage,
+		"--operation", "begin-final-verification", "--input", input,
+	}, io.Discard)
+	if !errors.Is(err, reviewtransaction.ErrLegacyReadOnly) {
+		t.Fatalf("legacy review-step error = %v", err)
+	}
+	fresh, err := reviewtransaction.AuthoritativeStore(context.Background(), fixture.repo, fixture.lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, _, err := fresh.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fresh.Append(fixture.head, reviewtransaction.Record{Operation: "review/complete-final-verification", Transaction: record.Transaction}); !errors.Is(err, reviewtransaction.ErrLegacyReadOnly) {
+		t.Fatalf("legacy direct append error = %v", err)
+	}
+	after, err := os.ReadFile(headPath)
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("legacy mutation changed HEAD: %v", err)
+	}
+}
+
+func TestReviewSubcommandHelpLabelsLegacyMutationReadOnly(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func([]string, io.Writer) error
+	}{
+		{name: "review-start", run: RunReviewStart},
+		{name: "review-step", run: RunReviewStep},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			if err := test.run([]string{"--help"}, &output); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(strings.ToLower(output.String()), "read-only") {
+				t.Fatalf("legacy help does not label mutation read-only:\n%s", output.String())
+			}
+		})
+	}
+}
+
+func TestReviewGateActionScopeChangedRequiresExplicitMaintainerAction(t *testing.T) {
+	for _, tt := range []struct {
+		result reviewtransaction.GateResult
+		want   string
+	}{
+		{reviewtransaction.GateAllow, "continue"},
+		{reviewtransaction.GateScopeChanged, "explicit-maintainer-action"},
+		{reviewtransaction.GateInvalidated, "explicit-maintainer-action"},
+		// organic-dx Phase 3b task 3b.3: STATUS already re-derives escalated
+		// recovery eligibility (accounting-only, changed-target, or
+		// final-verification-retry), so the gate denial now names
+		// review.status instead of a bare stop that told the caller nothing
+		// it did not already know.
+		{reviewtransaction.GateEscalated, "review.status"},
+	} {
+		t.Run(string(tt.result), func(t *testing.T) {
+			result := ReviewValidateResult{Result: tt.result, Allowed: tt.result == reviewtransaction.GateAllow, Action: reviewGateAction(tt.result)}
+			payload, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Action != tt.want || result.Allowed != (tt.result == reviewtransaction.GateAllow) || strings.Contains(string(payload), "create-new-lineage") {
+				t.Fatalf("gate result = %s", payload)
+			}
+		})
+	}
+}
+
+type legacyCLIFixture struct {
+	repo, lineage, policyPath, ledgerPath, evidencePath, receiptPath string
+	store                                                            reviewtransaction.Store
+	head                                                             string
+}
+
+func newLegacyCLIFixture(t *testing.T, lineage string) legacyCLIFixture {
+	t.Helper()
+	repo := initReviewCLIRepo(t)
+	branch := strings.TrimSpace(runReviewCLIGit(t, repo, "symbolic-ref", "--short", "HEAD"))
+	configureCLIReviewPublicationRemote(t, repo, branch)
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("candidate\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "policy.md")
+	ledgerPath := filepath.Join(dir, "ledger.json")
+	evidencePath := filepath.Join(dir, "evidence.txt")
+	if err := os.WriteFile(policyPath, []byte("legacy bounded policy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := reviewtransaction.CanonicalLedger([]reviewtransaction.Finding{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ledgerPath, ledger, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(evidencePath, []byte("legacy verification passed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).Build(context.Background(), reviewtransaction.Target{
+		Kind: reviewtransaction.TargetCurrentChanges, Projection: reviewtransaction.ProjectionWorkspace, IntendedUntracked: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyHash, _ := reviewtransaction.HashArtifact(policyPath)
+	ledgerHash, _ := reviewtransaction.HashLedgerArtifact(ledgerPath)
+	evidenceHash, _ := reviewtransaction.HashArtifact(evidencePath)
+	tx, err := reviewtransaction.NewTransaction(reviewtransaction.Start{
+		LineageID: lineage, Mode: reviewtransaction.ModeOrdinary4R, Generation: 1,
+		Snapshot: snapshot, PolicyHash: policyHash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := reviewtransaction.AuthoritativeStore(context.Background(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.StartReview(); err != nil {
+		t.Fatal(err)
+	}
+	head := appendLegacyCLIRecord(t, store, "", "review/start", *tx)
+	if err := tx.FreezeFindings([]reviewtransaction.Finding{}, ledger, ledgerHash); err != nil {
+		t.Fatal(err)
+	}
+	head = appendLegacyCLIRecord(t, store, head, "review/freeze-findings", *tx)
+	if _, err := tx.ClassifyEvidence([]reviewtransaction.FindingEvidence{}); err != nil {
+		t.Fatal(err)
+	}
+	head = appendLegacyCLIRecord(t, store, head, "review/classify-evidence", *tx)
+	if err := tx.BeginFinalVerification(); err != nil {
+		t.Fatal(err)
+	}
+	head = appendLegacyCLIRecord(t, store, head, "review/begin-final-verification", *tx)
+	if err := tx.CompleteFinalVerification(evidenceHash, true); err != nil {
+		t.Fatal(err)
+	}
+	head = appendLegacyCLIRecord(t, store, head, "review/complete-final-verification", *tx)
+	receipt, err := tx.Receipt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(store.Dir, "artifacts", "receipt.json")
+	if err := reviewtransaction.WriteReceiptAtomic(receiptPath, receipt); err != nil {
+		t.Fatal(err)
+	}
+	return legacyCLIFixture{
+		repo: repo, lineage: lineage, policyPath: policyPath, ledgerPath: ledgerPath,
+		evidencePath: evidencePath, receiptPath: receiptPath, store: store, head: head,
+	}
+}
+
+func appendLegacyCLIRecord(t *testing.T, store reviewtransaction.Store, previous, operation string, transaction reviewtransaction.Transaction) string {
+	t.Helper()
+	revision, err := store.Append(previous, reviewtransaction.Record{Operation: operation, Transaction: transaction})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision
+}
+
+func configureCLIReviewPublicationRemote(t *testing.T, repo, branch string) {
+	t.Helper()
+	remote := filepath.Join(t.TempDir(), "origin.git")
+	runReviewCLIGit(t, repo, "clone", "--bare", repo, remote)
+	runReviewCLIGit(t, repo, "remote", "add", "origin", remote)
+	runReviewCLIGit(t, repo, "config", "branch."+branch+".remote", "origin")
+	runReviewCLIGit(t, repo, "config", "branch."+branch+".merge", "refs/heads/"+branch)
+}
+
+func assertReviewGateResult(t *testing.T, payload []byte, want reviewtransaction.GateResult) {
+	t.Helper()
+	var result ReviewValidateResult
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != want || result.Allowed != (want == reviewtransaction.GateAllow) {
+		t.Fatalf("review gate result = %#v, want %q", result, want)
+	}
+}
+
+// canonicalReviewCLITempDir returns t.TempDir() in its canonical spelling.
+// Production resolvers answer with the canonical form, so a fixture that keeps
+// the raw spelling compares unequal to its own repository: on the Windows
+// runners TEMP is an 8.3 short name, and on macOS /var symlinks /private/var.
+func canonicalReviewCLITempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func initReviewCLIRepo(t *testing.T) string {
+	t.Helper()
+	repo := canonicalReviewCLITempDir(t)
+	runReviewCLIGit(t, repo, "init", "-q")
+	runReviewCLIGit(t, repo, "config", "user.email", "test@example.com")
+	runReviewCLIGit(t, repo, "config", "user.name", "Test")
+	runReviewCLIGit(t, repo, "config", "core.autocrlf", "false")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runReviewCLIGit(t, repo, "add", "tracked.txt")
+	runReviewCLIGit(t, repo, "commit", "-qm", "base")
+	return repo
+}
+
+func runReviewCLIGit(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+	return string(output)
+}
+
+func writeReviewCLIJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	payload, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(payload, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// reviewCLIAuthorityRoot and writeReconcileCLIRecord used to live in
+// review_reconcile_test.go, retired in Wave 7 S3a along with the CLI verb it
+// tested — both helpers are shared, reused across review_repair_test.go,
+// review_abandon_test.go, review_partial_capture_deadend_test.go,
+// review_incident_recapture_test.go, review_inspect_authority_test.go,
+// review_reconcile_batch_test.go, and review_repair_transition_test.go
+// (confirmed by grep before the retiring commit), so they moved here rather
+// than dying with their original home.
+
+func reviewCLIAuthorityRoot(t *testing.T, repo string) string {
+	t.Helper()
+	commonDir := filepath.Clean(strings.TrimSpace(runReviewCLIGit(t, repo, "rev-parse", "--path-format=absolute", "--git-common-dir")))
+	return filepath.Join(commonDir, "gentle-ai", "review-transactions")
+}
+
+// writeReconcileCLIRecord persists one compact-v2 record directly to disk
+// (bypassing the product's own write path) so a fixture can seed an exact,
+// already-known revision for a test to bind against.
+func writeReconcileCLIRecord(t *testing.T, repo string, state reviewtransaction.CompactState) string {
+	t.Helper()
+	revision, err := reviewtransaction.CompactRevisionForState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := reviewtransaction.CompactRecord{Schema: "gentle-ai.review-state-record/v2", Revision: revision, State: state}
+	payload, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(reviewCLIAuthorityRoot(t, repo), "v2", state.LineageID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "review-state.json"), append(payload, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return revision
+}

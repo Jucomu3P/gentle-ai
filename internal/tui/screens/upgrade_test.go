@@ -2,11 +2,12 @@ package screens
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
-	"github.com/gentleman-programming/gentle-ai/internal/update"
-	"github.com/gentleman-programming/gentle-ai/internal/update/upgrade"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/update"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/update/upgrade"
 )
 
 // ─── RenderUpgrade states ──────────────────────────────────────────────────
@@ -125,6 +126,54 @@ func TestRenderUpgrade_ErrorState(t *testing.T) {
 	if !strings.Contains(strings.ToLower(out), "return") {
 		t.Errorf("RenderUpgrade(upgradeErr) should contain 'return' hint; got:\n%s", out)
 	}
+}
+
+// TestRenderUpgrade_LongManualHintSplitsAcrossLines verifies that a long ManualHint
+// containing ": " is split so the command appears on its own line and is not clipped
+// by BubbleTea at the terminal width.
+func TestRenderUpgrade_LongManualHintSplitsAcrossLines(t *testing.T) {
+	longHint := "Windows binary distribution is temporarily unavailable. Install/update from source with Go 1.25.10+:\n  go install github.com/gentleman-programming/gentle-ai/v2/cmd/gentle-ai@v1.1.0"
+	report := &upgrade.UpgradeReport{
+		Results: []upgrade.ToolUpgradeResult{
+			{
+				ToolName:   "gentle-ai",
+				OldVersion: "v1.0.0",
+				NewVersion: "v1.1.0",
+				Status:     upgrade.UpgradeSkipped,
+				ManualHint: longHint,
+			},
+		},
+	}
+
+	out := stripANSI(RenderUpgradeWithWidth(nil, report, nil, false, true, 0, 0, 80))
+	lines := strings.Split(out, "\n")
+
+	preambleIndex := -1
+	for i, line := range lines {
+		if strings.Contains(line, "Go 1.25.10+:") {
+			preambleIndex = i
+			break
+		}
+	}
+	if preambleIndex == -1 {
+		t.Fatalf("hint preamble should appear in output; got:\n%s", out)
+	}
+	if !strings.Contains(out, "go install") || !strings.Contains(out, "gentle-ai/v2/cmd/gentle-ai@v1.1.0") {
+		t.Fatalf("full manual command should remain visible; got:\n%s", out)
+	}
+	for _, line := range lines[preambleIndex+1:] {
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+		if len(line) > 80 {
+			t.Fatalf("manual hint line exceeds terminal width: len=%d line=%q\noutput:\n%s", len(line), line, out)
+		}
+	}
+}
+
+func stripANSI(s string) string {
+	ansiPattern := regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+	return ansiPattern.ReplaceAllString(s, "")
 }
 
 // TestRenderUpgrade_TitleAlwaysPresent verifies that the "Upgrade Tools" title

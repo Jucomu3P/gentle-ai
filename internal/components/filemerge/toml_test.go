@@ -24,6 +24,65 @@ func TestUpsertCodexEngramBlock_Empty(t *testing.T) {
 	}
 }
 
+func TestRemoveTOMLTable(t *testing.T) {
+	input := "model = \"gpt-5.5\"\n\n[mcp_servers.engram]\ncommand = \"engram\"\nargs = [\"mcp\"]\n\n[other]\nvalue = true\n"
+	got := RemoveTOMLTable(input, "mcp_servers.engram")
+	if strings.Contains(got, "[mcp_servers.engram]") || strings.Contains(got, "command = \"engram\"") {
+		t.Fatalf("RemoveTOMLTable() kept removed table; got:\n%s", got)
+	}
+	if !strings.Contains(got, "model = \"gpt-5.5\"") || !strings.Contains(got, "[other]") {
+		t.Fatalf("RemoveTOMLTable() did not preserve unrelated content; got:\n%s", got)
+	}
+}
+
+func TestRemoveTOMLTable_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		tableName string
+		want      string
+	}{
+		{
+			name:      "table at EOF without trailing newline",
+			input:     "model = \"gpt-5.5\"\n\n[mcp_servers.engram]\ncommand = \"engram\"",
+			tableName: "mcp_servers.engram",
+			want:      "model = \"gpt-5.5\"\n",
+		},
+		{
+			name:      "absent table preserves LF content unchanged",
+			input:     "model = \"gpt-5.5\"\n\n[other]\nvalue = true\n",
+			tableName: "mcp_servers.engram",
+			want:      "model = \"gpt-5.5\"\n\n[other]\nvalue = true\n",
+		},
+		{
+			name:      "preserves top-level and next table boundaries",
+			input:     "model = \"gpt-5.5\"\n\n[mcp_servers.engram]\ncommand = \"engram\"\n\n[other]\nvalue = true\n",
+			tableName: "mcp_servers.engram",
+			want:      "model = \"gpt-5.5\"\n\n[other]\nvalue = true\n",
+		},
+		{
+			name:      "adjacent tables keep following table",
+			input:     "[mcp_servers.engram]\ncommand = \"engram\"\n[other]\nvalue = true\n",
+			tableName: "mcp_servers.engram",
+			want:      "[other]\nvalue = true\n",
+		},
+		{
+			name:      "CRLF input is normalized to LF",
+			input:     "model = \"gpt-5.5\"\r\n\r\n[mcp_servers.engram]\r\ncommand = \"engram\"\r\n[other]\r\nvalue = true\r\n",
+			tableName: "mcp_servers.engram",
+			want:      "model = \"gpt-5.5\"\n\n[other]\nvalue = true\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RemoveTOMLTable(tt.input, tt.tableName); got != tt.want {
+				t.Fatalf("RemoveTOMLTable() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestUpsertCodexEngramBlock_ExistingBlock(t *testing.T) {
 	input := `[other_section]
 key = "value"
@@ -159,6 +218,78 @@ command = "engram"
 	}
 }
 
+func TestUpsertTopLevelTOMLString_ReplacesAssignmentVariants(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "tab before equals",
+			input: "model\t= \"old-top-level-model\"\n\n[mcp_servers.engram]\ncommand = \"engram\"\n",
+			want: `model = "new-top-level-model"
+[mcp_servers.engram]
+command = "engram"
+`,
+		},
+		{
+			name: "multiline basic value",
+			input: `model = """
+old-top-level-model
+"""
+
+[mcp_servers.engram]
+command = "engram"
+`,
+			want: `model = "new-top-level-model"
+[mcp_servers.engram]
+command = "engram"
+`,
+		},
+		{
+			name: "multiline literal value",
+			input: `model = '''
+old-top-level-model
+'''
+
+[mcp_servers.engram]
+command = "engram"
+`,
+			want: `model = "new-top-level-model"
+[mcp_servers.engram]
+command = "engram"
+`,
+		},
+		{
+			name: "multiline array value",
+			input: `model = [
+  "old-top-level-model",
+]
+other = "preserved"
+
+[mcp_servers.engram]
+command = "engram"
+`,
+			want: `other = "preserved"
+
+model = "new-top-level-model"
+[mcp_servers.engram]
+command = "engram"
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := UpsertTopLevelTOMLString(tt.input, "model", "new-top-level-model")
+
+			if got != tt.want {
+				t.Fatalf("UpsertTopLevelTOMLString() mismatch (-want +got):\nwant:\n%s\ngot:\n%s", tt.want, got)
+			}
+		})
+	}
+}
+
 func TestUpsertTopLevelTOMLString_Idempotent(t *testing.T) {
 	input := `[mcp_servers.engram]
 command = "engram"
@@ -168,6 +299,157 @@ command = "engram"
 
 	if first != second {
 		t.Fatalf("UpsertTopLevelTOMLString is not idempotent:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+}
+
+func TestUpsertTopLevelTOMLString_PreservesHomonymousTableAssignments(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name: "standard table",
+			input: `model = "old-top-level-model"
+model_reasoning_effort = "low"
+
+[profiles.default] # user profile
+model = "nested-model"
+model_reasoning_effort = "nested-effort"
+`,
+			want: `model = "new-top-level-model"
+model_reasoning_effort = "high"
+[profiles.default] # user profile
+model = "nested-model"
+model_reasoning_effort = "nested-effort"
+`,
+		},
+		{
+			name: "array table",
+			input: `model = "old-top-level-model"
+model_reasoning_effort = "low"
+
+[[profiles]] # user profile
+model = "nested-model"
+model_reasoning_effort = "nested-effort"
+`,
+			want: `model = "new-top-level-model"
+model_reasoning_effort = "high"
+[[profiles]] # user profile
+model = "nested-model"
+model_reasoning_effort = "nested-effort"
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := UpsertTopLevelTOMLString(tt.input, "model", "new-top-level-model")
+			got = UpsertTopLevelTOMLString(got, "model_reasoning_effort", "high")
+
+			if got != tt.want {
+				t.Fatalf("UpsertTopLevelTOMLString() mismatch (-want +got):\nwant:\n%s\ngot:\n%s", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestUpsertTopLevelTOMLString_PreservesRootMultilineArrays(t *testing.T) {
+	input := `items = [
+["value"]
+]
+model = "old"
+`
+
+	got := UpsertTopLevelTOMLString(input, "model", "new")
+
+	if !strings.Contains(got, `items = [
+["value"]
+]
+`) {
+		t.Fatalf("root array was modified:\n%s", got)
+	}
+	if strings.Count(got, `model = "new"`) != 1 {
+		t.Fatalf("expected exactly one replacement, got:\n%s", got)
+	}
+	if strings.Contains(got, `model = "old"`) {
+		t.Fatalf("old root assignment was retained:\n%s", got)
+	}
+}
+
+func TestUpsertTopLevelTOMLString_IgnoresTableLikeMultilineValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name: "basic string with array table text",
+			input: `instructions = """
+[[profiles]]
+"""
+model = "old-top-level-model"
+
+[mcp_servers.engram]
+command = "engram"
+`,
+			want: `instructions = """
+[[profiles]]
+"""
+
+model = "new-top-level-model"
+[mcp_servers.engram]
+command = "engram"
+`,
+		},
+		{
+			name: "literal string with standard table text",
+			input: `instructions = '''
+[profiles.default]
+'''
+model = "old-top-level-model"
+
+[mcp_servers.engram]
+command = "engram"
+`,
+			want: `instructions = '''
+[profiles.default]
+'''
+
+model = "new-top-level-model"
+[mcp_servers.engram]
+command = "engram"
+`,
+		},
+		{
+			name: "basic string with root key text",
+			input: `instructions = """
+model = "example text"
+"""
+model = "old-top-level-model"
+
+[mcp_servers.engram]
+command = "engram"
+`,
+			want: `instructions = """
+model = "example text"
+"""
+
+model = "new-top-level-model"
+[mcp_servers.engram]
+command = "engram"
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := UpsertTopLevelTOMLString(tt.input, "model", "new-top-level-model")
+
+			if got != tt.want {
+				t.Fatalf("UpsertTopLevelTOMLString() mismatch (-want +got):\nwant:\n%s\ngot:\n%s", tt.want, got)
+			}
+		})
 	}
 }
 

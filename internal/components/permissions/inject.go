@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/gentleman-programming/gentle-ai/internal/agents"
-	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
-	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/agents"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/components/filemerge"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
 )
 
 type InjectionResult struct {
@@ -16,11 +16,9 @@ type InjectionResult struct {
 
 // TargetPath returns the file path that permission injection creates or updates
 // for the adapter, or an empty string when the agent has no supported
-// permission injection target.
+// permission injection target. Codex has no target: gentle-ai relies on Codex's
+// built-in default permissions and does not write its permissions config at all.
 func TargetPath(homeDir string, adapter agents.Adapter) string {
-	if adapter.Agent() == model.AgentCodex {
-		return adapter.MCPConfigPath(homeDir, "")
-	}
 	if agentOverlay(adapter.Agent()) == nil {
 		return ""
 	}
@@ -72,7 +70,15 @@ var openCodeOverlayJSON = []byte(`{
       "git push": "ask",
       "git push --force *": "ask",
       "git rebase *": "ask",
-      "git reset --hard *": "ask"
+      "git reset --hard *": "ask",
+      "ssh": "ask",
+      "ssh *": "ask",
+      "scp": "ask",
+      "scp *": "ask",
+      "sftp": "ask",
+      "sftp *": "ask",
+      "rsync": "ask",
+      "rsync *": "ask"
     },
     "read": {
       "*": "allow",
@@ -138,7 +144,13 @@ func agentOverlay(id model.AgentID) []byte {
 		// Cursor manages permissions via cli-config.json, not settings.json.
 		return nil
 	case model.AgentCodex:
-		// Codex has no known settings.json path; permissions are skipped.
+		// Codex relies on its built-in default permissions. gentle-ai writes
+		// nothing to Codex's permissions config — not a profile, and not the
+		// legacy cleanup that used to strip one. Codex refuses to load a config
+		// that defines a [permissions.*] profile without default_permissions,
+		// so a cleanup removing the pointer while a user profile survived left
+		// Codex unable to start (#1794). An old gentle-dev profile stays until
+		// its owner removes it.
 		return nil
 	case model.AgentHermes:
 		// Hermes permission format is undocumented — no overlay is injected (§14).
@@ -149,11 +161,7 @@ func agentOverlay(id model.AgentID) []byte {
 }
 
 func Inject(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
-	if adapter.Agent() == model.AgentCodex {
-		return injectCodexPermissions(homeDir, adapter)
-	}
-
-	settingsPath := adapter.SettingsPath(homeDir)
+	settingsPath := TargetPath(homeDir, adapter)
 	if settingsPath == "" {
 		return InjectionResult{}, nil
 	}
@@ -163,7 +171,8 @@ func Inject(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
 		return InjectionResult{}, nil
 	}
 
-	writeResult, err := mergeJSONFile(settingsPath, overlay)
+	defaults := adapter.Agent() == model.AgentOpenCode || adapter.Agent() == model.AgentKilocode
+	writeResult, err := mergeJSONFile(settingsPath, overlay, defaults)
 	if err != nil {
 		return InjectionResult{}, err
 	}
@@ -171,82 +180,17 @@ func Inject(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
 	return InjectionResult{Changed: writeResult.Changed, Files: []string{settingsPath}}, nil
 }
 
-func injectCodexPermissions(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
-	configPath := adapter.MCPConfigPath(homeDir, "")
-	baseTOML, err := osReadFile(configPath)
-	if err != nil {
-		return InjectionResult{}, err
-	}
-
-	merged := filemerge.UpsertTopLevelTOMLString(string(baseTOML), "approval_policy", "on-request")
-	merged = filemerge.UpsertTopLevelTOMLString(merged, "default_permissions", "gentle-dev")
-	merged = filemerge.RemoveTOMLTableKeys(merged, "permissions.gentle-dev", []string{"extends"})
-	merged = filemerge.UpsertTOMLTableKey(merged, "permissions.gentle-dev", "description", `"Comfortable local development profile with workspace writes, network access, Git metadata writes, Nix/Home Manager support, and secret-file protections."`)
-	merged = filemerge.UpsertTOMLTableKey(merged, "permissions.gentle-dev.network", "enabled", "true")
-	merged = filemerge.UpsertTOMLTableKey(merged, "permissions.gentle-dev.network.domains", `"*"`, `"allow"`)
-
-	merged = filemerge.RemoveTOMLTableKeys(merged, `permissions.gentle-dev.filesystem.":root"`, []string{`"."`})
-	for _, path := range []string{
-		`":minimal"`,
-		`"~/.config/git"`,
-		`"~/.gitconfig"`,
-		`"~/.local/state/nix/profiles/home-manager/home-path"`,
-		`"~/.nix-profile"`,
-		`"/nix/store"`,
-	} {
-		merged = filemerge.UpsertTOMLTableKey(merged, "permissions.gentle-dev.filesystem", path, `"read"`)
-	}
-	for _, path := range []string{
-		`":tmpdir"`,
-		`":slash_tmp"`,
-	} {
-		merged = filemerge.UpsertTOMLTableKey(merged, "permissions.gentle-dev.filesystem", path, `"write"`)
-	}
-
-	merged = filemerge.UpsertTOMLTableKey(merged, "permissions.gentle-dev.workspace_roots", `"~"`, "true")
-
-	workspaceRootsSection := `permissions.gentle-dev.filesystem.":workspace_roots"`
-	merged = filemerge.RemoveTOMLTableKeys(merged, workspaceRootsSection, []string{
-		`"**/.git"`,
-		`"**/.git/**"`,
-		`"**/.env.*"`,
-		`"*.env.*"`,
-	})
-	merged = filemerge.UpsertTOMLTableKey(merged, workspaceRootsSection, `"."`, `"write"`)
-	merged = filemerge.UpsertTOMLTableKey(merged, workspaceRootsSection, `".git/**"`, `"write"`)
-
-	for _, pattern := range []string{
-		`"**/.env"`,
-		`"**/.env.local"`,
-		`"**/.env.*.local"`,
-		`"**/.aws/credentials"`,
-		`"**/.config/gh/hosts.yml"`,
-		`"**/.credentials/**"`,
-		`"**/.ssh/**"`,
-		`"**/Library/Keychains/**"`,
-		`"**/credentials.json"`,
-		`"**/*.pem"`,
-		`"**/*.key"`,
-		`"**/secrets/**"`,
-	} {
-		merged = filemerge.UpsertTOMLTableKey(merged, workspaceRootsSection, pattern, `"deny"`)
-	}
-
-	writeResult, err := filemerge.WriteFileAtomic(configPath, []byte(merged), 0o644)
-	if err != nil {
-		return InjectionResult{}, err
-	}
-
-	return InjectionResult{Changed: writeResult.Changed, Files: []string{configPath}}, nil
-}
-
-func mergeJSONFile(path string, overlay []byte) (filemerge.WriteResult, error) {
+func mergeJSONFile(path string, overlay []byte, defaults bool) (filemerge.WriteResult, error) {
 	baseJSON, err := osReadFile(path)
 	if err != nil {
 		return filemerge.WriteResult{}, err
 	}
 
-	merged, err := filemerge.MergeJSONObjects(baseJSON, overlay)
+	merge := filemerge.MergeJSONObjectsForPath
+	if defaults {
+		merge = filemerge.MergeJSONDefaultsForPath
+	}
+	merged, err := merge(path, baseJSON, overlay)
 	if err != nil {
 		return filemerge.WriteResult{}, err
 	}

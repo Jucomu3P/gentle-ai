@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
-	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/components/filemerge"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
 )
 
 type Definition struct {
@@ -52,7 +52,7 @@ const gentleLogoPluginFile = "gentle-logo.tsx"
 
 const gentleLogoPluginSource = `// @ts-nocheck
 /** @jsxImportSource @opentui/solid */
-import type { TuiPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
+import type { TuiPlugin } from "@opencode-ai/plugin/tui"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createMemo } from "solid-js"
 
@@ -81,7 +81,7 @@ const roseArt = [
 
 const compactArt = ["✦ Gentle AI ✦"]
 
-const Logo = (props: { theme: TuiThemeCurrent }) => {
+const Logo = () => {
   const dim = useTerminalDimensions()
   const lines = createMemo(() => {
     const term = dim()
@@ -91,7 +91,7 @@ const Logo = (props: { theme: TuiThemeCurrent }) => {
   return (
     <box flexDirection="column" alignItems="center">
       {lines().map((line) => (
-        <text fg={props.theme.accent}>{line}</text>
+        <text fg="magenta">{line}</text>
       ))}
     </box>
   )
@@ -102,8 +102,8 @@ const tui: TuiPlugin = async (api) => {
     id,
     order: 100,
     slots: {
-      home_logo(ctx) {
-        return <Logo theme={ctx.theme.current} />
+      home_logo() {
+        return <Logo />
       },
     },
   })
@@ -126,6 +126,37 @@ func DefinitionFor(id model.OpenCodeCommunityPluginID) (Definition, bool) {
 		}
 	}
 	return Definition{}, false
+}
+
+// InstallPaths returns every path a selected plugin installation can mutate.
+// The outer install snapshot uses this before apply so later failures restore
+// plugin registration and plugin-owned assets together.
+func InstallPaths(homeDir string, selected []model.OpenCodeCommunityPluginID) ([]string, error) {
+	opencodeDir := filepath.Join(homeDir, ".config", "opencode")
+	tuiPath := filepath.Join(opencodeDir, "tui.json")
+	paths := make([]string, 0, len(selected)+1)
+	seen := map[string]struct{}{}
+	addPath := func(path string) {
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+
+	for _, id := range selected {
+		switch id {
+		case model.OpenCodePluginGentleLogo:
+			addPath(filepath.Join(opencodeDir, "tui-plugins", gentleLogoPluginFile))
+		default:
+			if _, ok := DefinitionFor(id); !ok {
+				return nil, fmt.Errorf("unknown OpenCode community plugin %q", id)
+			}
+		}
+		addPath(tuiPath)
+	}
+
+	return paths, nil
 }
 
 func Install(homeDir string, id model.OpenCodeCommunityPluginID) (Result, error) {
@@ -154,8 +185,7 @@ func Install(homeDir string, id model.OpenCodeCommunityPluginID) (Result, error)
 
 func installGentleLogo(homeDir string) (Result, error) {
 	opencodeDir := filepath.Join(homeDir, ".config", "opencode")
-	pluginDir := filepath.Join(opencodeDir, "tui-plugins")
-	pluginPath := filepath.Join(pluginDir, gentleLogoPluginFile)
+	pluginPath := filepath.Join(opencodeDir, "tui-plugins", gentleLogoPluginFile)
 	tuiPath := filepath.Join(opencodeDir, "tui.json")
 
 	pluginWrite, err := filemerge.WriteFileAtomic(pluginPath, []byte(gentleLogoPluginSource), 0o644)
@@ -202,6 +232,45 @@ func ensureTUIPlugin(path, pkg string) (bool, error) {
 		return false, err
 	}
 	return wr.Changed, nil
+}
+
+// removeTUIPlugin is the uninstall-side mirror of ensureTUIPlugin. It removes
+// every occurrence of pkg from tui.json's plugin[] list. It returns the exact
+// replacement bytes without writing so the caller can perform a guarded write.
+// If the file is missing or pkg is not present, it returns (false, nil, nil).
+func removeTUIPlugin(path, pkg string) (bool, []byte, error) {
+	root := map[string]any{"$schema": "https://opencode.ai/tui.json"}
+	data, readErr := os.ReadFile(path)
+	switch {
+	case readErr == nil && len(bytes.TrimSpace(data)) > 0:
+		if err := json.Unmarshal(data, &root); err != nil {
+			return false, nil, fmt.Errorf("parse OpenCode TUI config %q: %w", path, err)
+		}
+	case readErr != nil && !os.IsNotExist(readErr):
+		return false, nil, fmt.Errorf("read OpenCode TUI config %q: %w", path, readErr)
+	}
+
+	plugins := stringSlice(root["plugin"])
+	kept := make([]string, 0, len(plugins))
+	changedAny := false
+	for _, existing := range plugins {
+		if existing == pkg {
+			changedAny = true
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	if !changedAny {
+		return false, nil, nil
+	}
+	root["plugin"] = kept
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return false, nil, err
+	}
+	out = append(out, '\n')
+	return true, out, nil
 }
 
 func stringSlice(value any) []string {

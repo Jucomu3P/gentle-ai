@@ -1,0 +1,36 @@
+{
+  "schema": "gentle-ai.review-integration.consent/v1",
+  "contract": "gentle-ai.review-integration/v1",
+  "operation": "review.start",
+  "action": "consent_required",
+  "blocking": true,
+  "target_identity": "sha256:04c970c2b0f7c128751ed2b0f7e672a2fe26dc267f018bf10e612096d19cfa04",
+  "projection": "workspace",
+  "risk_level": "high",
+  "changed_files": 1,
+  "changed_lines": 1,
+  "headline": "Gentle AI can review this change before you call it done.",
+  "reason": "Review can help detect execution issues in these changes.",
+  "value": "Reviewing takes a little longer and makes the result safer.",
+  "risk_evidence": [
+    "shell scripting in scripts/deploy.sh"
+  ],
+  "choices": [
+    {
+      "answer": "granted",
+      "label": "Review this change",
+      "effect": "Reviews only this change; later medium- or high-risk changes ask again, and delivery needs separate approval.",
+      "invocation": "gentle-ai review start --contract gentle-ai.review-integration/v1 --cwd /repo --target sha256:04c970c2b0f7c128751ed2b0f7e672a2fe26dc267f018bf10e612096d19cfa04 --projection workspace --lineage review-consent-fixture --consent granted"
+    },
+    {
+      "answer": "declined",
+      "label": "Skip this time",
+      "effect": "Skips only this change; no review record is created, and future reviews stay enabled.",
+      "invocation": "gentle-ai review start --contract gentle-ai.review-integration/v1 --cwd /repo --target sha256:04c970c2b0f7c128751ed2b0f7e672a2fe26dc267f018bf10e612096d19cfa04 --projection workspace --lineage review-consent-fixture --consent declined"
+    }
+  ],
+  "off_path": {
+    "note": "To turn reviews off for good, run 'gentle-ai review mode disable'.",
+    "command": "gentle-ai review mode disable"
+  }
+}

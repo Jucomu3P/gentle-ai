@@ -6,13 +6,14 @@ import (
 
 // Tools is the static registry of managed tools that can be checked for updates.
 //
-// InstallMethod controls which upgrade strategy the executor uses:
-//   - InstallBrew: managed via homebrew (macOS/Linux with brew)
+// InstallMethod controls which non-Homebrew upgrade strategy the executor uses:
+//   - InstallBrew: explicitly managed via Homebrew
 //   - InstallGoInstall: installed via `go install <GoImportPath>@version`
 //   - InstallBinary: downloaded binary from GitHub Releases (atomic replace)
 //
-// For brew-managed platforms the executor picks brew regardless of the
-// field here; InstallMethod represents the non-brew fallback strategy.
+// On platforms where Homebrew is available, the executor selects brew only
+// when Homebrew confirms it owns the specific tool. Otherwise this field is
+// the fallback strategy.
 var Tools = []ToolInfo{
 	{
 		Name:          "gentle-ai",
@@ -20,9 +21,15 @@ var Tools = []ToolInfo{
 		Repo:          "gentle-ai",
 		DetectCmd:     nil, // version comes from build-time ldflags (app.Version)
 		VersionPrefix: "v",
-		// gentle-ai: brew on macOS, binary release download on Linux.
-		// Windows self-upgrade uses the PowerShell installer so the running binary can exit before replacement.
+		// gentle-ai: Homebrew when the package is brew-owned, authenticated binary
+		// release download on Linux/macOS, and `go install` on Windows, where no
+		// official signed binary is published.
 		InstallMethod: InstallBinary,
+		// GoImportPath is what makes the Windows self-upgrade possible. It is
+		// deliberately NOT a general opt-in to go-install: effectiveMethod routes
+		// gentle-ai on Linux/macOS to InstallBinary regardless of this field, so
+		// those platforms keep the minisign-verified release download.
+		GoImportPath: "github.com/gentleman-programming/gentle-ai/v2/cmd/gentle-ai",
 	},
 	{
 		Name:              "engram",
@@ -31,7 +38,7 @@ var Tools = []ToolInfo{
 		DetectCmd:         []string{"engram", "version"},
 		VersionPrefix:     "v",
 		ReleaseTagPattern: `^v[0-9]+\.[0-9]+\.[0-9]+$`,
-		// engram: brew on macOS/Linux-brew, binary download elsewhere.
+		// engram: Homebrew when the package is brew-owned, binary download elsewhere.
 		InstallMethod: InstallBinary,
 		// FallbackPaths covers the Windows stale-PATH scenario (and Linux ~/.local/bin
 		// when not yet in PATH): AddToUserPath updates the registry/profile but the
@@ -60,7 +67,7 @@ var Tools = []ToolInfo{
 		Repo:          "gentleman-guardian-angel",
 		DetectCmd:     []string{"gga", "--version"},
 		VersionPrefix: "v",
-		// gga: brew on macOS, install.sh script on Linux/Windows.
+		// gga: Homebrew when the package is brew-owned, install.sh script elsewhere.
 		// GGA does not publish pre-built release binary assets — only source archives.
 		// Using InstallScript runs curl | bash via the project's install.sh.
 		InstallMethod: InstallScript,

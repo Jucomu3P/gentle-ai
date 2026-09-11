@@ -8,10 +8,40 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gentleman-programming/gentle-ai/internal/assets"
-	"github.com/gentleman-programming/gentle-ai/internal/model"
-	"github.com/gentleman-programming/gentle-ai/internal/opencode"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/assets"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/opencode"
 )
+
+func TestProfileCleanupPreservesPermissionOrder(t *testing.T) {
+	for _, operation := range []string{"stale", "kilo", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "opencode.json")
+			seed := `{"permission":{"bash":{"ssh *":"allow","*":"deny"}},"agent":{"jd-judge-a-test":{"permission":{"bash":"deny"}},"sdd-apply-test":{}}}`
+			if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			profile := model.Profile{Name: "test"}
+			var err error
+			switch operation {
+			case "stale":
+				_, err = cleanupStaleProfileJDAgents(path, profile)
+			case "kilo":
+				profile.PhaseAssignments = map[string]model.ModelAssignment{"jd-judge-a": {ProviderID: "test", ModelID: "test"}}
+				_, err = cleanupKilocodeProfileJDPermissions(path, profile)
+			case "remove":
+				err = RemoveProfileAgents(path, "test")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || !strings.Contains(strings.Join(strings.Fields(string(got)), ""), `"bash":{"ssh*":"allow","*":"deny"}`) {
+				t.Fatalf("cleanup changed last-match deny: %s, %v", got, err)
+			}
+		})
+	}
+}
 
 func TestResolveProfileStrategy_ExplicitWins(t *testing.T) {
 	home := t.TempDir()
@@ -109,6 +139,7 @@ func TestProfileAgentKeys_Named(t *testing.T) {
 		"sdd-orchestrator-cheap",
 		"sdd-init-cheap",
 		"sdd-explore-cheap",
+		"sdd-research-cheap",
 		"sdd-propose-cheap",
 		"sdd-spec-cheap",
 		"sdd-design-cheap",
@@ -145,6 +176,7 @@ func TestProfileAgentKeys_Default(t *testing.T) {
 		"sdd-orchestrator",
 		"sdd-init",
 		"sdd-explore",
+		"sdd-research",
 		"sdd-propose",
 		"sdd-spec",
 		"sdd-design",
@@ -171,11 +203,11 @@ func TestProfileAgentKeys_Default(t *testing.T) {
 }
 
 func TestProfileAgentKeys_Count(t *testing.T) {
-	if n := len(ProfileAgentKeys("cheap")); n != 14 {
-		t.Errorf("ProfileAgentKeys(\"cheap\") = %d keys, want 14", n)
+	if n := len(ProfileAgentKeys("cheap")); n != 15 {
+		t.Errorf("ProfileAgentKeys(\"cheap\") = %d keys, want 15", n)
 	}
-	if n := len(ProfileAgentKeys("")); n != 11 {
-		t.Errorf("ProfileAgentKeys(\"\") = %d keys, want 11", n)
+	if n := len(ProfileAgentKeys("")); n != 12 {
+		t.Errorf("ProfileAgentKeys(\"\") = %d keys, want 12", n)
 	}
 }
 
@@ -246,6 +278,20 @@ func TestDetectProfiles_DefaultOnly(t *testing.T) {
 	}
 	if len(profiles) != 0 {
 		t.Fatalf("DetectProfiles() returned %d profiles, want 0 (default is not a detected profile)", len(profiles))
+	}
+}
+
+func TestDetectProfiles_OrphanedManagedPhase(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "opencode.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"agent":{"sdd-apply-fast":{"tools":{"read":true}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := DetectProfiles(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 || profiles[0].Name != "fast" {
+		t.Fatalf("DetectProfiles() = %#v, want orphaned fast profile", profiles)
 	}
 }
 
@@ -390,7 +436,7 @@ func makeHaikuProfile() model.Profile {
 	haikuModel := model.ModelAssignment{ProviderID: "anthropic", ModelID: "claude-haiku-3-5"}
 	phases := map[string]model.ModelAssignment{}
 	for _, ph := range []string{
-		"sdd-init", "sdd-explore", "sdd-propose", "sdd-spec",
+		"sdd-init", "sdd-explore", "sdd-research", "sdd-propose", "sdd-spec",
 		"sdd-design", "sdd-tasks", "sdd-apply", "sdd-verify",
 		"sdd-archive", "sdd-onboard",
 	} {
@@ -403,10 +449,14 @@ func makeHaikuProfile() model.Profile {
 	}
 }
 
+func openCodeSettingsPathForTest(home string) string {
+	return filepath.Join(home, ".config", "opencode", "opencode.json")
+}
+
 func TestGenerateProfileOverlay_Structure(t *testing.T) {
 	home := t.TempDir()
 
-	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home)
+	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
@@ -425,9 +475,9 @@ func TestGenerateProfileOverlay_Structure(t *testing.T) {
 		t.Fatal("overlay 'agent' is not an object")
 	}
 
-	// Must have 11 agents
-	if len(agentMap) != 11 {
-		t.Errorf("agent map has %d entries, want 11", len(agentMap))
+	// Must have 12 agents
+	if len(agentMap) != 12 {
+		t.Errorf("agent map has %d entries, want 12", len(agentMap))
 	}
 
 	// Orchestrator checks
@@ -479,7 +529,7 @@ func TestGenerateProfileOverlay_Structure(t *testing.T) {
 func TestGenerateProfileOverlay_PermissionScoped(t *testing.T) {
 	home := t.TempDir()
 
-	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home)
+	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
@@ -524,7 +574,7 @@ func TestGenerateProfileOverlay_JDAssignmentsGenerateSuffixedAgents(t *testing.T
 	profile.PhaseAssignments["jd-judge-b"] = model.ModelAssignment{ProviderID: "openai", ModelID: "gpt-5.1"}
 	profile.PhaseAssignments["jd-fix-agent"] = model.ModelAssignment{ProviderID: "anthropic", ModelID: "claude-sonnet-4-20250514"}
 
-	overlay, err := GenerateProfileOverlay(profile, home)
+	overlay, err := GenerateProfileOverlay(profile, home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
@@ -535,8 +585,8 @@ func TestGenerateProfileOverlay_JDAssignmentsGenerateSuffixedAgents(t *testing.T
 	}
 	agentMap := root["agent"].(map[string]any)
 
-	if len(agentMap) != 14 {
-		t.Fatalf("agent map has %d entries, want 14; keys: %v", len(agentMap), keysOf(agentMap))
+	if len(agentMap) != 15 {
+		t.Fatalf("agent map has %d entries, want 15; keys: %v", len(agentMap), keysOf(agentMap))
 	}
 
 	checks := map[string]string{
@@ -597,7 +647,7 @@ func TestGenerateProfileOverlay_JDAssignmentsGenerateSuffixedAgents(t *testing.T
 func TestGenerateProfileOverlay_NoJDAssignmentsUsesGlobalJDAgents(t *testing.T) {
 	home := t.TempDir()
 
-	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home)
+	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
@@ -629,10 +679,10 @@ func TestGenerateProfileOverlay_NoJDAssignmentsUsesGlobalJDAgents(t *testing.T) 
 	}
 }
 
-func TestGenerateProfileOverlay_ToolsUseReplaceSentinel(t *testing.T) {
+func TestGenerateProfileOverlayOmitsDeprecatedTools(t *testing.T) {
 	home := t.TempDir()
 
-	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home)
+	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
@@ -643,24 +693,9 @@ func TestGenerateProfileOverlay_ToolsUseReplaceSentinel(t *testing.T) {
 	}
 
 	agentMap := root["agent"].(map[string]any)
-	orch := agentMap["sdd-orchestrator-cheap"].(map[string]any)
-	toolsWrapper, ok := orch["tools"].(map[string]any)
-	if !ok {
-		t.Fatal("sdd-orchestrator-cheap tools is not an object")
-	}
-	tools, hasSentinel := toolsWrapper["__replace__"].(map[string]any)
-	if !hasSentinel {
-		t.Fatal("tools block must use __replace__ sentinel to discard legacy delegate tools on sync")
-	}
-
-	for _, required := range []string{"read", "write", "edit", "bash", "task"} {
-		if enabled, _ := tools[required].(bool); !enabled {
-			t.Fatalf("required tool %q missing or disabled: %#v", required, tools)
-		}
-	}
-	for _, legacyTool := range []string{"delegate", "delegation_read", "delegation_list"} {
-		if _, exists := tools[legacyTool]; exists {
-			t.Fatalf("legacy OpenCode tool %q must not be present: %#v", legacyTool, tools)
+	for name, raw := range agentMap {
+		if _, exists := raw.(map[string]any)["tools"]; exists {
+			t.Fatalf("profile agent %q emits deprecated tools: %#v", name, raw)
 		}
 	}
 }
@@ -697,7 +732,7 @@ func TestDefaultOverlayTaskPermissions_ExplicitAllowlist(t *testing.T) {
 	}
 }
 
-func TestDefaultOverlayToolsUseReplaceSentinel(t *testing.T) {
+func TestDefaultOverlayOmitsDeprecatedTools(t *testing.T) {
 	for _, assetPath := range []string{
 		"opencode/sdd-overlay-single.json",
 		"opencode/sdd-overlay-multi.json",
@@ -709,21 +744,9 @@ func TestDefaultOverlayToolsUseReplaceSentinel(t *testing.T) {
 			}
 
 			agentMap := root["agent"].(map[string]any)
-			orch := agentMap["gentle-orchestrator"].(map[string]any)
-			toolsWrapper := orch["tools"].(map[string]any)
-			tools, hasSentinel := toolsWrapper["__replace__"].(map[string]any)
-			if !hasSentinel {
-				t.Fatal("tools block must use __replace__ sentinel to discard legacy delegate tools on sync")
-			}
-
-			for _, required := range []string{"read", "write", "edit", "bash", "task"} {
-				if enabled, _ := tools[required].(bool); !enabled {
-					t.Fatalf("required tool %q missing or disabled: %#v", required, tools)
-				}
-			}
-			for _, legacyTool := range []string{"delegate", "delegation_read", "delegation_list"} {
-				if _, exists := tools[legacyTool]; exists {
-					t.Fatalf("legacy OpenCode tool %q must not be present: %#v", legacyTool, tools)
+			for name, raw := range agentMap {
+				if _, exists := raw.(map[string]any)["tools"]; exists {
+					t.Fatalf("%s agent %q emits deprecated tools: %#v", assetPath, name, raw)
 				}
 			}
 		})
@@ -733,7 +756,7 @@ func TestDefaultOverlayToolsUseReplaceSentinel(t *testing.T) {
 func TestGenerateProfileOverlay_TaskPermissionsBlockCrossProfileDelegation(t *testing.T) {
 	home := t.TempDir()
 
-	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home)
+	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
@@ -771,12 +794,10 @@ func TestGenerateProfileOverlay_TaskPermissionsBlockCrossProfileDelegation(t *te
 func TestGenerateProfileOverlay_SubAgentFileRefs(t *testing.T) {
 	home := t.TempDir()
 
-	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home)
+	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
-
-	promptDir := SharedPromptDir(home)
 
 	var root map[string]any
 	if err := json.Unmarshal(overlay, &root); err != nil {
@@ -788,7 +809,10 @@ func TestGenerateProfileOverlay_SubAgentFileRefs(t *testing.T) {
 		key := phase + "-cheap"
 		agent := agentMap[key].(map[string]any)
 		prompt, _ := agent["prompt"].(string)
-		expectedRef := "{file:" + filepath.ToSlash(filepath.Join(promptDir, phase+".md")) + "}"
+		expectedRef, err := SharedPromptFileRef(openCodeSettingsPathForTest(home), home, phase)
+		if err != nil {
+			t.Fatalf("SharedPromptFileRef() error = %v", err)
+		}
 		if prompt != expectedRef {
 			t.Errorf("sub-agent %q prompt = %q, want %q", key, prompt, expectedRef)
 		}
@@ -798,7 +822,7 @@ func TestGenerateProfileOverlay_SubAgentFileRefs(t *testing.T) {
 func TestGenerateProfileOverlay_OrchestratorPromptSuffixed(t *testing.T) {
 	home := t.TempDir()
 
-	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home)
+	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
@@ -833,6 +857,35 @@ func TestGenerateProfileOverlay_OrchestratorPromptSuffixed(t *testing.T) {
 	} {
 		if !strings.Contains(prompt, wanted) {
 			t.Fatalf("profile orchestrator prompt missing %q", wanted)
+		}
+	}
+}
+
+func TestGenerateProfileOverlay_ExcludesDesktopDelegationVisibility(t *testing.T) {
+	home := t.TempDir()
+
+	overlay, err := GenerateProfileOverlay(makeHaikuProfile(), home, openCodeSettingsPathForTest(home), nil, "")
+	if err != nil {
+		t.Fatalf("GenerateProfileOverlay() error = %v", err)
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(overlay, &root); err != nil {
+		t.Fatalf("overlay is not valid JSON: %v", err)
+	}
+	agentMap := root["agent"].(map[string]any)
+	prompt := agentMap["sdd-orchestrator-cheap"].(map[string]any)["prompt"].(string)
+
+	for _, unwanted := range []string{
+		"<!-- gentle-ai:opencode-desktop-delegation-progress -->",
+		"#### Delegation Visibility (OpenCode Desktop)",
+		"⏳ Delegating {phase} to {agent}...",
+		"✅ {agent} completed — {status}",
+		"⚠️ {agent} returned {status} — {short reason}",
+		"<!-- /gentle-ai:opencode-desktop-delegation-progress -->",
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("named profile orchestrator prompt contains default Desktop progress wording %q", unwanted)
 		}
 	}
 }
@@ -976,14 +1029,16 @@ func keysOf(m map[string]any) []string {
 
 func expectedTaskPermissions(suffix string) map[string]any {
 	permissions := map[string]any{
-		"*": "deny",
+		"*":       "deny",
+		"general": "allow",
+		"explore": "allow",
 	}
 	for _, phase := range profilePhaseOrder {
 		permissions[phase+suffix] = "allow"
 	}
 	// Review agents are global (not profile-scoped), so named profile
 	// orchestrators also need unsuffixed permissions to delegate to them.
-	for _, reviewAgent := range reviewAgentNames {
+	for _, reviewAgent := range opencode.ReviewPhases() {
 		permissions[reviewAgent] = "allow"
 	}
 	// JD agents are global (not profile-scoped) — always unsuffixed.
@@ -1026,6 +1081,70 @@ func TestExtractModelFromAgent_NoVariantDefaultsEmpty(t *testing.T) {
 	}
 }
 
+// TestExtractModelFromAgent_OpenRouterFreeModel verifies that extractModelFromAgent
+// correctly parses OpenRouter free-model specs like "openrouter/qwen/qwen3.6-plus:free".
+// The first separator is "/" (not ":"), so the provider should be "openrouter" and
+// the model should be "qwen/qwen3.6-plus:free".
+func TestExtractModelFromAgent_OpenRouterFreeModel(t *testing.T) {
+	agentMap := map[string]any{
+		"model": "openrouter/qwen/qwen3.6-plus:free",
+	}
+	got := extractModelFromAgent(agentMap)
+	if got.ProviderID != "openrouter" {
+		t.Errorf("extractModelFromAgent ProviderID = %q, want %q", got.ProviderID, "openrouter")
+	}
+	if got.ModelID != "qwen/qwen3.6-plus:free" {
+		t.Errorf("extractModelFromAgent ModelID = %q, want %q", got.ModelID, "qwen/qwen3.6-plus:free")
+	}
+}
+
+// TestDetectProfiles_OpenRouterFreeModel verifies that DetectProfiles
+// correctly parses OpenRouter free-model specs when detecting profiles.
+func TestDetectProfiles_OpenRouterFreeModel(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "opencode.json")
+
+	content := `{
+  "agent": {
+    "sdd-orchestrator-openr": { "mode": "primary", "model": "openrouter/qwen/qwen3.6-plus:free" },
+    "sdd-apply-openr": { "mode": "subagent", "model": "openrouter/qwen/qwen3.6-plus:free" }
+  }
+}`
+	if err := os.WriteFile(settingsPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	profiles, err := DetectProfiles(settingsPath)
+	if err != nil {
+		t.Fatalf("DetectProfiles() error = %v", err)
+	}
+	if len(profiles) != 1 {
+		t.Fatalf("DetectProfiles() returned %d profiles, want 1", len(profiles))
+	}
+
+	p := profiles[0]
+	if p.Name != "openr" {
+		t.Errorf("Profile.Name = %q, want %q", p.Name, "openr")
+	}
+	if p.OrchestratorModel.ProviderID != "openrouter" {
+		t.Errorf("OrchestratorModel.ProviderID = %q, want %q", p.OrchestratorModel.ProviderID, "openrouter")
+	}
+	if p.OrchestratorModel.ModelID != "qwen/qwen3.6-plus:free" {
+		t.Errorf("OrchestratorModel.ModelID = %q, want %q", p.OrchestratorModel.ModelID, "qwen/qwen3.6-plus:free")
+	}
+
+	m, ok := p.PhaseAssignments["sdd-apply"]
+	if !ok {
+		t.Fatal("sdd-apply missing from PhaseAssignments")
+	}
+	if m.ProviderID != "openrouter" {
+		t.Errorf("PhaseAssignments[sdd-apply] ProviderID = %q, want %q", m.ProviderID, "openrouter")
+	}
+	if m.ModelID != "qwen/qwen3.6-plus:free" {
+		t.Errorf("PhaseAssignments[sdd-apply] ModelID = %q, want %q", m.ModelID, "qwen/qwen3.6-plus:free")
+	}
+}
+
 // TestGenerateProfileOverlay_VariantInjected verifies that a profile
 // phase assignment with Effort="medium" results in "variant":"medium"
 // in the generated overlay JSON.
@@ -1040,7 +1159,7 @@ func TestGenerateProfileOverlay_VariantInjected(t *testing.T) {
 		},
 	}
 
-	overlay, err := GenerateProfileOverlay(profile, home)
+	overlay, err := GenerateProfileOverlay(profile, home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}
@@ -1072,7 +1191,7 @@ func TestGenerateProfileOverlay_EmptyEffortClearsVariant(t *testing.T) {
 		},
 	}
 
-	overlay, err := GenerateProfileOverlay(profile, home)
+	overlay, err := GenerateProfileOverlay(profile, home, openCodeSettingsPathForTest(home), nil, "")
 	if err != nil {
 		t.Fatalf("GenerateProfileOverlay() error = %v", err)
 	}

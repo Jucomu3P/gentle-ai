@@ -14,6 +14,59 @@ func TestInjectMarkdownSection_EmptyFile(t *testing.T) {
 	}
 }
 
+func TestExtractHTMLCommentSection(t *testing.T) {
+	content := "before\n<!-- section:model-small -->\nsmall body\n<!-- /section:model-small -->\nafter\n"
+	if got := ExtractHTMLCommentSection(content, "model-small"); got != "small body\n" {
+		t.Fatalf("ExtractHTMLCommentSection() = %q, want section body", got)
+	}
+	if got := ExtractHTMLCommentSection(content, "missing"); got != content {
+		t.Fatalf("ExtractHTMLCommentSection() missing = %q, want original content", got)
+	}
+}
+
+func TestExtractHTMLCommentSection_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "lone start marker returns original content",
+			content: "before\n<!-- section:model-small -->\nsmall body\n",
+		},
+		{
+			name:    "lone end marker returns original content",
+			content: "before\n<!-- /section:model-small -->\nafter\n",
+		},
+		{
+			name:    "reversed markers return original content",
+			content: "<!-- /section:model-small -->\nbody\n<!-- section:model-small -->\n",
+		},
+		{
+			name:    "repeated sections extract the first complete section",
+			content: "<!-- section:model-small -->\nfirst\n<!-- /section:model-small -->\n<!-- section:model-small -->\nsecond\n<!-- /section:model-small -->\n",
+			want:    "first\n",
+		},
+		{
+			name:    "extra trailing end marker is ignored after first pair",
+			content: "<!-- section:model-small -->\nbody\n<!-- /section:model-small -->\n<!-- /section:model-small -->\n",
+			want:    "body\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := tt.want
+			if want == "" {
+				want = tt.content
+			}
+			if got := ExtractHTMLCommentSection(tt.content, "model-small"); got != want {
+				t.Fatalf("ExtractHTMLCommentSection() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestInjectMarkdownSection_AppendToExistingContent(t *testing.T) {
 	existing := "# My Config\n\nSome existing content.\n"
 	result := InjectMarkdownSection(existing, "persona", "You are a senior architect.\n")
@@ -31,6 +84,71 @@ func TestInjectMarkdownSection_UpdateExistingSection(t *testing.T) {
 	want := "# Config\n\n<!-- gentle-ai:sdd -->\nNew SDD content.\n<!-- /gentle-ai:sdd -->\n\nOther stuff.\n"
 	if result != want {
 		t.Fatalf("update existing section:\ngot:  %q\nwant: %q", result, want)
+	}
+}
+
+func TestInjectMarkdownSection_CollapsesDuplicateTargetSections(t *testing.T) {
+	const (
+		open  = "<!-- gentle-ai:persona -->"
+		close = "<!-- /gentle-ai:persona -->"
+	)
+
+	first := open + "\nfirst\n" + close
+	second := open + "\nsecond\n" + close
+	third := open + "\nthird\n" + close
+	canonical := open + "\ncurrent\n" + close
+	sdd := "<!-- gentle-ai:sdd -->\nkeep sdd\n<!-- /gentle-ai:sdd -->"
+
+	tests := []struct {
+		name        string
+		existing    string
+		replacement string
+		want        string
+	}{
+		{
+			name:        "adjacent duplicate blocks",
+			existing:    first + second,
+			replacement: "current\n",
+			want:        canonical,
+		},
+		{
+			name:        "user content between duplicate blocks",
+			existing:    "# Before\n\n" + first + "\nUser middle.\n\n" + second + "\n# After\n",
+			replacement: "current\n",
+			want:        "# Before\n\n" + canonical + "\nUser middle.\n\n\n# After\n",
+		},
+		{
+			name:        "three duplicate blocks collapse in one call",
+			existing:    first + "\n" + second + "\n" + third,
+			replacement: "current\n",
+			want:        canonical + "\n\n",
+		},
+		{
+			name:        "unrelated managed section remains unchanged",
+			existing:    first + "\n" + sdd + "\n" + second,
+			replacement: "current\n",
+			want:        canonical + "\n" + sdd + "\n",
+		},
+		{
+			name:        "empty replacement removes every target block",
+			existing:    "# Before\n\n" + first + "\nUser middle.\n\n" + second + "\n# After\n",
+			replacement: "",
+			want:        "# Before\nUser middle.\n\n\n# After\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := InjectMarkdownSection(tt.existing, "persona", tt.replacement)
+			if got != tt.want {
+				t.Fatalf("InjectMarkdownSection() = %q, want %q", got, tt.want)
+			}
+
+			secondRun := InjectMarkdownSection(got, "persona", tt.replacement)
+			if secondRun != got {
+				t.Fatalf("second injection changed result:\nfirst:  %q\nsecond: %q", got, secondRun)
+			}
+		})
 	}
 }
 
@@ -396,6 +514,23 @@ func TestStripLegacyPersonaBlock_AllFingerprintsPreMarker_Strips(t *testing.T) {
 	}
 	if !strings.Contains(result, "<!-- gentle-ai:persona -->") {
 		t.Fatal("all-fingerprints-pre-marker: marker section must be preserved")
+	}
+}
+
+func TestStripLegacyPersonaBlock_SlimResidualInstallNotFalselyStripped(t *testing.T) {
+	// A slim (post-canonical-channel) install's pre-marker zone never contains
+	// "## Personality" or "Senior Architect" — those live only in the output
+	// style now. Only "## Rules" (and the "Persona Voice" pointer) remain in
+	// the residual marker section. With 2 of 3 fingerprints permanently
+	// missing, this must NEVER be falsely stripped as legacy content.
+	preMarker := "## Rules\n\n- Never add \"Co-Authored-By\" or AI attribution to commits.\n\n"
+	markerSection := "<!-- gentle-ai:persona -->\n## Persona Voice\n\nSee the active output style.\n<!-- /gentle-ai:persona -->\n"
+
+	input := preMarker + markerSection
+	result := StripLegacyPersonaBlock(input)
+
+	if result != input {
+		t.Fatalf("slim residual install: expected unchanged result (missing 2/3 fingerprints):\ngot:  %q\nwant: %q", result, input)
 	}
 }
 

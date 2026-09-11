@@ -9,11 +9,11 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/gentleman-programming/gentle-ai/internal/agents"
-	"github.com/gentleman-programming/gentle-ai/internal/agents/codex"
-	"github.com/gentleman-programming/gentle-ai/internal/assets"
-	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
-	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/agents"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/agents/claude"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/agents/codex"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/components/filemerge"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
 )
 
 type InjectionResult struct {
@@ -175,26 +175,45 @@ type InjectOptions struct {
 	// Set to true only when the user explicitly opts in via a CLI flag or TUI choice.
 	CodexMultiAgent bool
 
+	// CodexOrchestratorAssignment updates top-level model settings when non-nil.
+	// nil preserves the user's existing main-session configuration.
+	CodexOrchestratorAssignment *model.CodexOrchestratorAssignment
+
 	// CodexCarrilModelAssignments holds the resolved carril→model-id map used
 	// when writing SDD profile .config.toml files. nil/empty = use canonical
-	// defaults (sdd-strong/sdd-mid=gpt-5.5, sdd-cheap=gpt-5.4-mini).
+	// defaults (sdd-strong=gpt-5.6-sol, sdd-mid=gpt-5.6-terra, sdd-cheap=gpt-5.6-luna).
 	CodexCarrilModelAssignments map[string]string
 
 	// CodexModelAssignments holds the resolved phase→effort map used to derive
 	// the per-carril reasoning_effort written to SDD profile files.
 	// nil/empty = use canonical defaults.
 	CodexModelAssignments map[string]model.CodexEffort
+
+	// Version carries the raw installed engram binary version string (e.g.
+	// "engram 1.18.0"), as returned by VerifyVersion(). It feeds the
+	// Decision 1 version-gate: the Claude Code CLAUDE.md section only
+	// renders slim when Version parses to >= v1.4.0. Empty, unknown, or
+	// unparseable values fall back to the full section (safe default). A
+	// raw string (rather than a bool) is required to support the inclusive
+	// at-floor v1.4.0 boundary comparison.
+	Version string
 }
 
 func Inject(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
-	return injectWithOptions(homeDir, homeDir, adapter, InjectOptions{})
+	return injectWithOptions(homeDir, homeDir, adapter, InjectOptions{}, true)
 }
 
 // InjectWithOptions is like Inject but accepts additional options such as the
 // Codex multi-agent opt-in flag. Use this when the caller has a model.Selection
 // and needs to forward user-chosen configuration into the injection pass.
 func InjectWithOptions(homeDir string, adapter agents.Adapter, opts InjectOptions) (InjectionResult, error) {
-	return injectWithOptions(homeDir, homeDir, adapter, opts)
+	return injectWithOptions(homeDir, homeDir, adapter, opts, true)
+}
+
+// InjectWorkspaceWithOptions preserves the existing workspace-scoped delivery.
+// Claude's user registry migration is intentionally limited to user scope.
+func InjectWorkspaceWithOptions(workspaceDir string, adapter agents.Adapter, opts InjectOptions) (InjectionResult, error) {
+	return injectWithOptions(workspaceDir, workspaceDir, adapter, opts, false)
 }
 
 // InjectWithPromptDir writes Engram's MCP configuration using configHomeDir and
@@ -202,7 +221,7 @@ func InjectWithOptions(homeDir string, adapter agents.Adapter, opts InjectOption
 // as OpenClaw where MCP is loaded from the global config but instructions are
 // read from an active workspace.
 func InjectWithPromptDir(configHomeDir, promptDir string, adapter agents.Adapter) (InjectionResult, error) {
-	return injectWithOptions(configHomeDir, promptDir, adapter, InjectOptions{})
+	return injectWithOptions(configHomeDir, promptDir, adapter, InjectOptions{}, true)
 }
 
 const antigravityEngramPluginJSON = `{
@@ -282,7 +301,7 @@ func installAntigravityEngramPlugin(homeDir, engramCommand string) (bool, []stri
 	return changed, files, nil
 }
 
-func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, opts InjectOptions) (InjectionResult, error) {
+func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, opts InjectOptions, userScope bool) (InjectionResult, error) {
 	if provisioner, ok := adapter.(piEngramProvisioner); ok {
 		changed, files, err := provisioner.ProvisionEngramMCP(configHomeDir)
 		if err != nil {
@@ -304,6 +323,15 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 	// 1. Write MCP server config using the adapter's strategy.
 	switch adapter.MCPStrategy() {
 	case model.StrategySeparateMCPFiles:
+		if adapter.Agent() == model.AgentClaudeCode && userScope {
+			result, err := injectClaudeUserConfig(configHomeDir, adapter)
+			if err != nil {
+				return InjectionResult{}, err
+			}
+			changed = changed || result.Changed
+			files = append(files, result.Files...)
+			break
+		}
 		// Engram v1.10.3+ writes an absolute path for the command field when
 		// `engram setup <agent>` is invoked. gentle-ai's Inject() runs after
 		// engram setup, so we must preserve any absolute command path already
@@ -353,12 +381,13 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 		files = append(files, mcpPath)
 
 		if adapter.Agent() == model.AgentAntigravity {
-			settingsWrite, settingsErr := ensureJSONFileIfMissing(adapter.SettingsPath(configHomeDir))
+			settingsTarget := adapter.SettingsPath(configHomeDir)
+			settingsWrite, settingsErr := ensureJSONFileIfMissing(settingsTarget)
 			if settingsErr != nil {
 				return InjectionResult{}, fmt.Errorf("ensure Antigravity settings: %w", settingsErr)
 			}
 			changed = changed || settingsWrite.Changed
-			files = append(files, adapter.SettingsPath(configHomeDir))
+			files = append(files, settingsTarget)
 
 			pluginChanged, pluginFiles, pluginErr := installAntigravityEngramPlugin(configHomeDir, engramCommand)
 			if pluginErr != nil {
@@ -394,12 +423,18 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 		if configPath == "" {
 			break
 		}
+		runtimeErr := codex.ValidateGPT56Runtime()
+		if runtimeErr != nil && !codex.IsGPT56RuntimeUnavailable(runtimeErr) {
+			return InjectionResult{}, runtimeErr
+		}
 
 		// Determine instruction file paths before mutating the config.
-		instructionsPath, compactPath, instrErr := writeCodexInstructionFiles(configHomeDir)
+		instructionsPath, compactPath, instructionsChanged, instructionFiles, instrErr := writeCodexInstructionFiles(configHomeDir)
 		if instrErr != nil {
 			return InjectionResult{}, instrErr
 		}
+		changed = changed || instructionsChanged
+		files = append(files, instructionFiles...)
 
 		// Read existing config and apply all mutations in a single pass.
 		//
@@ -440,6 +475,10 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 		// Step 2 — top-level instruction-file keys (before the first section header).
 		withInstr := filemerge.UpsertTopLevelTOMLString(withMaxDepth, "model_instructions_file", instructionsPath)
 		withCompact := filemerge.UpsertTopLevelTOMLString(withInstr, "experimental_compact_prompt_file", compactPath)
+		if opts.CodexOrchestratorAssignment != nil {
+			withCompact = filemerge.UpsertTopLevelTOMLString(withCompact, "model", opts.CodexOrchestratorAssignment.Model)
+			withCompact = filemerge.UpsertTopLevelTOMLString(withCompact, "model_reasoning_effort", string(opts.CodexOrchestratorAssignment.Effort))
+		}
 
 		// Step 3 — [mcp_servers.engram] block (always last; strip+re-append at EOF).
 		engramCmd := stableEngramCommandForMergedConfig(configPath, adapter.Agent())
@@ -452,18 +491,19 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 		changed = changed || tomlWrite.Changed
 		files = append(files, configPath)
 
-		// Write gentle-ai SDD model-selection profile files into ~/.codex/.
-		// These use the separate-file mechanism from Codex >= 0.134.0 and are
-		// selected at runtime via `codex --profile <name>`.
-		// codexHomeDir is the ~/.codex directory (the parent of config.toml).
-		codexHomeDir := filepath.Dir(configPath)
-		profileAssignments := resolveProfileAssignments(opts.CodexCarrilModelAssignments, opts.CodexModelAssignments)
-		profilesChanged, profileFiles, profileErr := codex.WriteCodexProfiles(codexHomeDir, profileAssignments)
-		if profileErr != nil {
-			return InjectionResult{}, profileErr
+		// Write gentle-ai SDD model-selection profile files only when Codex is
+		// installed and supports GPT-5.6. Without the executable, shared config
+		// still works, but existing CLI-only profiles must remain untouched.
+		if runtimeErr == nil {
+			codexHomeDir := filepath.Dir(configPath)
+			profileAssignments := resolveProfileAssignments(opts.CodexCarrilModelAssignments, opts.CodexModelAssignments)
+			profilesChanged, profileFiles, profileErr := codex.WriteCodexProfiles(codexHomeDir, profileAssignments)
+			if profileErr != nil {
+				return InjectionResult{}, profileErr
+			}
+			changed = changed || profilesChanged
+			files = append(files, profileFiles...)
 		}
-		changed = changed || profilesChanged
-		files = append(files, profileFiles...)
 	}
 
 	// 2. Inject Engram memory protocol into system prompt (if supported).
@@ -471,7 +511,7 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 		switch adapter.SystemPromptStrategy() {
 		case model.StrategyMarkdownSections:
 			promptPath := adapter.SystemPromptFile(promptDir)
-			protocolContent := assets.MustRead("claude/engram-protocol.md")
+			protocolContent := protocolFor(adapter.Agent(), opts)
 
 			existing, err := readFileOrEmpty(promptPath)
 			if err != nil {
@@ -498,7 +538,7 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 			// Write the Engram protocol as a standalone Jinja include module.
 			// The static KIMI.md template references it via {% include "engram-protocol.md" %}.
 			configDir := adapter.GlobalConfigDir(promptDir)
-			protocolContent := assets.MustRead("claude/engram-protocol.md")
+			protocolContent := protocolFor(adapter.Agent(), opts)
 			modulePath := filepath.Join(configDir, "engram-protocol.md")
 			mdWrite, err := filemerge.WriteFileAtomic(modulePath, []byte(protocolContent), 0o644)
 			if err != nil {
@@ -509,7 +549,7 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 
 		default:
 			promptPath := adapter.SystemPromptFile(promptDir)
-			protocolContent := assets.MustRead("claude/engram-protocol.md")
+			protocolContent := protocolFor(adapter.Agent(), opts)
 
 			existing, err := readFileOrEmpty(promptPath)
 			if err != nil {
@@ -528,6 +568,62 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 	}
 
 	return InjectionResult{Changed: changed, Files: files}, nil
+}
+
+func injectClaudeUserConfig(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
+	// The plugin and direct MCP entry expose the same Engram tools. When the
+	// plugin is enabled, suppress direct registration without deleting any
+	// existing entry: matching config shape is not proof that gentle-ai owns it.
+	if claudeEngramPluginEnabled(homeDir) {
+		return InjectionResult{}, nil
+	}
+
+	legacyPath := adapter.MCPConfigPath(homeDir, "engram")
+	command := stableEngramCommandForMergedConfig(claude.UserConfigPath(homeDir), model.AgentClaudeCode)
+	legacyManaged := false
+	if raw, err := os.ReadFile(legacyPath); err == nil {
+		if legacyCommand, ok := managedLegacyClaudeEngramCommand(raw); ok {
+			command = stableEngramCommandForExisting(legacyCommand, model.AgentClaudeCode)
+			legacyManaged = true
+		}
+	} else if !os.IsNotExist(err) {
+		return InjectionResult{}, fmt.Errorf("read legacy Claude Engram config %q: %w", legacyPath, err)
+	}
+
+	writeResult, registryPath, err := claude.MergeUserConfig(homeDir, engramOverlayJSON(model.AgentClaudeCode, command))
+	if err != nil {
+		return InjectionResult{}, err
+	}
+	result := InjectionResult{Changed: writeResult.Changed, Files: []string{registryPath}}
+	if !legacyManaged {
+		return result, nil
+	}
+	removed, err := RemoveManagedLegacyClaudeConfig(legacyPath)
+	if err != nil {
+		return InjectionResult{}, err
+	}
+	if !removed {
+		return result, nil
+	}
+	result.Changed = true
+	result.Files = append(result.Files, legacyPath)
+	return result, nil
+}
+
+func claudeEngramPluginEnabled(homeDir string) bool {
+	settingsPath := filepath.Join(homeDir, ".claude", "settings.json")
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return false
+	}
+
+	var settings struct {
+		EnabledPlugins map[string]bool `json:"enabledPlugins"`
+	}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return false
+	}
+	return settings.EnabledPlugins["engram@engram"]
 }
 
 func validateOpenClawWorkspacePath(workspaceDir string, adapter agents.Adapter) error {
@@ -572,27 +668,29 @@ func ensureAntigravitySettings(homeDir string, adapter agents.Adapter) (settings
 }
 
 // writeCodexInstructionFiles writes the Engram memory protocol and compact prompt
-// files to ~/.codex/ and returns their paths.
-func writeCodexInstructionFiles(homeDir string) (instructionsPath, compactPath string, err error) {
+// files to ~/.codex/ and returns their paths and write results.
+func writeCodexInstructionFiles(homeDir string) (instructionsPath, compactPath string, changed bool, files []string, err error) {
 	codexDir := filepath.Join(homeDir, ".codex")
 	instructionsPath = filepath.Join(codexDir, "engram-instructions.md")
 	compactPath = filepath.Join(codexDir, "engram-compact-prompt.md")
 
-	instrContent := assets.MustRead("codex/engram-instructions.md")
+	instrContent := codexInstructions()
 	instrWrite, err := filemerge.WriteFileAtomic(instructionsPath, []byte(instrContent), 0o644)
 	if err != nil {
-		return "", "", fmt.Errorf("write codex engram-instructions.md: %w", err)
+		return "", "", false, nil, fmt.Errorf("write codex engram-instructions.md: %w", err)
 	}
-	_ = instrWrite
+	changed = instrWrite.Changed
+	files = append(files, instructionsPath)
 
-	compactContent := assets.MustRead("codex/engram-compact-prompt.md")
+	compactContent := codexCompact()
 	compactWrite, err := filemerge.WriteFileAtomic(compactPath, []byte(compactContent), 0o644)
 	if err != nil {
-		return "", "", fmt.Errorf("write codex engram-compact-prompt.md: %w", err)
+		return "", "", false, nil, fmt.Errorf("write codex engram-compact-prompt.md: %w", err)
 	}
-	_ = compactWrite
+	changed = changed || compactWrite.Changed
+	files = append(files, compactPath)
 
-	return instructionsPath, compactPath, nil
+	return instructionsPath, compactPath, changed, files, nil
 }
 
 func mergeJSONFile(path string, overlay []byte) (filemerge.WriteResult, error) {
@@ -601,7 +699,7 @@ func mergeJSONFile(path string, overlay []byte) (filemerge.WriteResult, error) {
 		return filemerge.WriteResult{}, err
 	}
 
-	merged, err := filemerge.MergeJSONObjects(baseJSON, overlay)
+	merged, err := filemerge.MergeJSONObjectsForPath(path, baseJSON, overlay)
 	if err != nil {
 		return filemerge.WriteResult{}, err
 	}
@@ -807,6 +905,96 @@ func buildSeparateMCPContent(mcpPath string, defaultContent []byte) []byte {
 		return defaultContent
 	}
 	return append(encoded, '\n')
+}
+
+func managedLegacyClaudeEngramCommand(content []byte) (string, bool) {
+	var server map[string]any
+	if err := json.Unmarshal(content, &server); err != nil || len(server) != 2 {
+		return "", false
+	}
+	command, ok := server["command"].(string)
+	if !ok || !isEngramCommand(command) {
+		return "", false
+	}
+	args, ok := server["args"].([]any)
+	if !ok || len(args) != 2 || args[0] != "mcp" || args[1] != "--tools=agent" {
+		return "", false
+	}
+	return command, true
+}
+
+// IsManagedLegacyClaudeConfig reports whether content has the exact legacy
+// standalone Engram server shape emitted by Gentle AI.
+func IsManagedLegacyClaudeConfig(content []byte) bool {
+	_, ok := managedLegacyClaudeEngramCommand(content)
+	return ok
+}
+
+// RemoveManagedLegacyClaudeConfig removes only the exact standalone shape
+// emitted by Gentle AI. Its parent is removed only when the same real directory
+// remains empty after that managed file is deleted; symlinks are never unlinked.
+func RemoveManagedLegacyClaudeConfig(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect managed legacy Claude Engram config %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return false, nil
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read managed legacy Claude Engram config %q: %w", path, err)
+	}
+	if !IsManagedLegacyClaudeConfig(content) {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil {
+		return false, fmt.Errorf("remove managed legacy Claude Engram config %q: %w", path, err)
+	}
+	if err := removeManagedLegacyClaudeParent(filepath.Dir(path)); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func removeManagedLegacyClaudeParent(parent string) error {
+	info, err := os.Lstat(parent)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect managed legacy Claude directory %q: %w", parent, err)
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return fmt.Errorf("read managed legacy Claude directory %q: %w", parent, err)
+	}
+	if len(entries) != 0 {
+		return nil
+	}
+	current, err := os.Lstat(parent)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reinspect managed legacy Claude directory %q: %w", parent, err)
+	}
+	if !current.IsDir() || !os.SameFile(info, current) {
+		return nil
+	}
+	if err := os.Remove(parent); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove empty managed legacy Claude directory %q: %w", parent, err)
+	}
+	return nil
 }
 
 // isEngramCommand reports whether cmd is either a relative "engram" command

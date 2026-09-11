@@ -1,5 +1,7 @@
 package pipeline
 
+import "errors"
+
 // OrchestratorOption configures the orchestrator.
 type OrchestratorOption func(*Orchestrator)
 
@@ -56,11 +58,18 @@ func (o *Orchestrator) Execute(plan StagePlan) ExecutionResult {
 	if o.policy.ShouldRollback(StageApply, applyResult.Err) {
 		result.Rollback = ExecuteRollback(applyResult.Steps, o.stepByID)
 		if !result.Rollback.Success {
-			result.Err = result.Rollback.Err
+			result.Err = errors.Join(result.Err, result.Rollback.Err)
 		}
 	}
 
 	return result
+}
+
+// Rollback compensates successful apply steps after a downstream consumer,
+// such as state persistence, fails. It must not be called after apply failure,
+// because Execute already performs that rollback.
+func (o *Orchestrator) Rollback(result ExecutionResult) StageResult {
+	return ExecuteRollback(result.Apply.Steps, o.stepByID)
 }
 
 func (o *Orchestrator) indexSteps(steps []Step) {

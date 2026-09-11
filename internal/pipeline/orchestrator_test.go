@@ -61,6 +61,24 @@ func TestOrchestratorRollsBackApplyStepsOnFailure(t *testing.T) {
 	}
 }
 
+// TestOrchestratorRollbackCompensatesSuccessfulApply verifies that a
+// downstream failure can explicitly roll back an otherwise successful apply.
+func TestOrchestratorRollbackCompensatesSuccessfulApply(t *testing.T) {
+	order := []string{}
+	orchestrator := NewOrchestrator(DefaultRollbackPolicy())
+	result := orchestrator.Execute(StagePlan{Apply: []Step{newRollbackStep("apply-1", &order, nil)}})
+	if result.Err != nil {
+		t.Fatalf("Execute() error = %v", result.Err)
+	}
+
+	rollback := orchestrator.Rollback(result)
+	if !rollback.Success || !reflect.DeepEqual(order, []string{"run:apply-1", "rollback:apply-1"}) {
+		t.Fatalf("rollback = %#v, order = %v", rollback, order)
+	}
+}
+
+// TestOrchestratorSkipsRollbackWhenPolicyDisabled verifies that a disabled
+// policy leaves failed apply steps without compensation.
 func TestOrchestratorSkipsRollbackWhenPolicyDisabled(t *testing.T) {
 	order := []string{}
 	orchestrator := NewOrchestrator(RollbackPolicy{OnApplyFailure: false})
@@ -256,6 +274,53 @@ func TestOrchestratorContinueOnErrorWithRollback(t *testing.T) {
 	// Rollback should fire because apply failed and policy is enabled.
 	if result.Rollback.Stage != StageRollback {
 		t.Fatalf("rollback stage = %q, want rollback", result.Rollback.Stage)
+	}
+}
+
+func TestExecuteRollbackAttemptsEveryStepAfterFailures(t *testing.T) {
+	order := []string{}
+	first := &testStep{id: "first", order: &order}
+	failed := &testStep{id: "failed", order: &order, rollErr: errors.New("restore failed")}
+	last := &testStep{id: "last", order: &order}
+	result := ExecuteRollback([]StepResult{{StepID: "first", Status: StepStatusSucceeded}, {StepID: "failed", Status: StepStatusSucceeded}, {StepID: "last", Status: StepStatusSucceeded}}, map[string]Step{"first": first, "failed": failed, "last": last})
+	if result.Success || len(result.Steps) != 3 || result.Steps[1].Status != StepStatusFailed {
+		t.Fatalf("rollback = %#v, want all three results with failed middle step", result)
+	}
+	if !reflect.DeepEqual(order, []string{"rollback:last", "rollback:failed", "rollback:first"}) {
+		t.Fatalf("order = %v", order)
+	}
+}
+
+// TestOrchestratorJoinsApplyAndRollbackErrors verifies that when apply fails
+// and the subsequent rollback also fails, Execute reports both errors instead
+// of letting the rollback error overwrite the original apply error.
+func TestOrchestratorJoinsApplyAndRollbackErrors(t *testing.T) {
+	order := []string{}
+	applyErr := errors.New("apply boom")
+	rollbackErr := errors.New("restore failed")
+	orchestrator := NewOrchestrator(DefaultRollbackPolicy())
+
+	result := orchestrator.Execute(StagePlan{
+		Apply: []Step{
+			&testStep{id: "apply-1", order: &order, rollErr: rollbackErr},
+			&testStep{id: "apply-2", order: &order, runErr: applyErr},
+		},
+	})
+
+	if result.Err == nil {
+		t.Fatalf("Execute() expected an error")
+	}
+	if !errors.Is(result.Err, applyErr) {
+		t.Fatalf("Execute() err = %v, want it to wrap apply error %v", result.Err, applyErr)
+	}
+	if !errors.Is(result.Err, rollbackErr) {
+		t.Fatalf("Execute() err = %v, want it to wrap rollback error %v", result.Err, rollbackErr)
+	}
+	if result.Rollback.Success {
+		t.Fatalf("Rollback.Success = true, want false")
+	}
+	if result.Rollback.Err == nil || !errors.Is(result.Rollback.Err, rollbackErr) {
+		t.Fatalf("Rollback.Err = %v, want it to wrap %v", result.Rollback.Err, rollbackErr)
 	}
 }
 

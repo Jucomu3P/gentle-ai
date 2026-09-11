@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
 )
 
 func TestReadCurrentModelAssignments(t *testing.T) {
@@ -37,6 +37,7 @@ func TestReadCurrentModelAssignments(t *testing.T) {
 		{"gentle-orchestrator", "anthropic", "claude-sonnet-4-20250514"},
 		{"sdd-apply", "openai", "gpt-4o"},
 		{"sdd-verify", "anthropic", "claude-haiku-3-20240307"},
+		{"some-other-agent", "anthropic", "claude-sonnet-4-20250514"},
 	}
 
 	for _, tt := range tests {
@@ -52,10 +53,107 @@ func TestReadCurrentModelAssignments(t *testing.T) {
 			t.Errorf("phase %q: ModelID = %q, want %q", tt.phase, a.ModelID, tt.modelID)
 		}
 	}
+}
 
-	// unrelated agents must not be included.
-	if _, ok := got["some-other-agent"]; ok {
-		t.Error("non-SDD agent should not be in result")
+func TestDiscoverCustomAgents(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "opencode.json")
+
+	content := `{
+  "agent": {
+    "gentle-orchestrator": { "model": "anthropic/claude-sonnet-4" },
+    "sdd-apply": { "model": "openai/gpt-4o" },
+    "z-custom-agent": { "model": "anthropic/claude-haiku-3" },
+    "a-custom-agent": { "model": "openai/gpt-4o-mini" }
+  }
+}`
+	if err := os.WriteFile(settingsPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	custom, err := DiscoverCustomAgents(settingsPath)
+	if err != nil {
+		t.Fatalf("DiscoverCustomAgents() error = %v", err)
+	}
+
+	want := []string{"a-custom-agent", "z-custom-agent"}
+	if len(custom) != len(want) {
+		t.Fatalf("DiscoverCustomAgents() len = %d, want %d; got %v", len(custom), len(want), custom)
+	}
+	for i := range want {
+		if custom[i] != want[i] {
+			t.Errorf("custom[%d] = %q, want %q", i, custom[i], want[i])
+		}
+	}
+}
+
+func TestDiscoverCustomAgentsExcludesReservedRolesAndDeduplicates(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "opencode.json")
+
+	content := `{
+  "agent": {
+    "build": { "model": "openai/gpt-5" },
+    "plan": { "model": "openai/gpt-5-mini" },
+    "general": { "model": "openai/gpt-5" },
+    "explore": { "model": "openai/gpt-5-mini" },
+    "gentle-reviewer": { "model": "openai/gpt-5" },
+    "gentle-worker": { "model": "openai/gpt-5-mini" },
+    "sdd-orchestrator": { "model": "openai/gpt-5" },
+    "review-validator": { "model": "openai/gpt-5-mini" },
+    "a-custom-agent": { "model": "openai/gpt-5-mini" },
+    "z-custom-agent": { "model": "openai/gpt-5" },
+    "a-custom-agent": { "model": "openai/gpt-5" }
+  }
+}`
+	if err := os.WriteFile(settingsPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	got, err := DiscoverCustomAgents(settingsPath)
+	if err != nil {
+		t.Fatalf("DiscoverCustomAgents() error = %v", err)
+	}
+	want := []string{"a-custom-agent", "z-custom-agent"}
+	if len(got) != len(want) {
+		t.Fatalf("DiscoverCustomAgents() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("DiscoverCustomAgents()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestReadCurrentModelAssignmentsIncludesReviewAgentsFromJSONC(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "opencode.json")
+	content := `{
+  // Reviewer models remain global across named profiles.
+  "agent": {
+    "review-risk": { "model": "anthropic/claude-sonnet-4" },
+    "review-readability": { "model": "openai/gpt-5" },
+    "review-reliability": { "model": "openai/gpt-5" },
+    "review-resilience": { "model": "anthropic/claude-sonnet-4" },
+    "review-refuter": { "model": "openai/gpt-5", "variant": "high" },
+    "review-validator": { "model": "openai/gpt-5-mini" },
+  },
+}`
+	if err := os.WriteFile(settingsPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	got, err := ReadCurrentModelAssignments(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadCurrentModelAssignments() error = %v", err)
+	}
+	for _, agent := range []string{"review-risk", "review-readability", "review-reliability", "review-resilience", "review-refuter", "review-validator"} {
+		if got[agent].ProviderID == "" || got[agent].ModelID == "" {
+			t.Errorf("review assignment %q missing: %v", agent, got)
+		}
+	}
+	if got["review-refuter"].Effort != "high" {
+		t.Fatalf("review-refuter effort = %q, want high", got["review-refuter"].Effort)
 	}
 }
 
@@ -212,6 +310,40 @@ func TestReadCurrentModelAssignmentsSlashSeparator(t *testing.T) {
 	}
 	if a.ModelID != "glm-5-turbo" {
 		t.Errorf("ModelID = %q, want %q", a.ModelID, "glm-5-turbo")
+	}
+}
+
+// TestReadCurrentModelAssignmentsOpenRouterFreeModel verifies that model specs
+// with multiple slashes and a colon (like "openrouter/qwen/qwen3.6-plus:free")
+// are parsed correctly. The provider is everything before the FIRST separator
+// (slash or colon), not before the colon. Issue #802.
+func TestReadCurrentModelAssignmentsOpenRouterFreeModel(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "opencode.json")
+
+	content := `{
+  "agent": {
+    "sdd-apply": { "model": "openrouter/qwen/qwen3.6-plus:free" }
+  }
+}`
+	if err := os.WriteFile(settingsPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	got, err := ReadCurrentModelAssignments(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadCurrentModelAssignments() error = %v", err)
+	}
+
+	a, ok := got["sdd-apply"]
+	if !ok {
+		t.Fatal("sdd-apply missing from result — OpenRouter free-model format not parsed")
+	}
+	if a.ProviderID != "openrouter" {
+		t.Errorf("ProviderID = %q, want %q", a.ProviderID, "openrouter")
+	}
+	if a.ModelID != "qwen/qwen3.6-plus:free" {
+		t.Errorf("ModelID = %q, want %q", a.ModelID, "qwen/qwen3.6-plus:free")
 	}
 }
 

@@ -1,6 +1,58 @@
 package model
 
+import "fmt"
+
 type AgentID string
+
+// OpenCodeBackgroundIntent is OpenCode's unresolved auto/on/off preference.
+type OpenCodeBackgroundIntent string
+
+const (
+	OpenCodeBackgroundAuto OpenCodeBackgroundIntent = "auto"
+	OpenCodeBackgroundOn   OpenCodeBackgroundIntent = "on"
+	OpenCodeBackgroundOff  OpenCodeBackgroundIntent = "off"
+)
+
+func (i OpenCodeBackgroundIntent) Valid() bool {
+	return i == OpenCodeBackgroundAuto || i == OpenCodeBackgroundOn || i == OpenCodeBackgroundOff
+}
+
+// ParseOpenCodeBackgroundIntent validates the persisted and user-supplied
+// control vocabulary without selecting a runtime behavior.
+func ParseOpenCodeBackgroundIntent(raw string) (OpenCodeBackgroundIntent, error) {
+	intent := OpenCodeBackgroundIntent(raw)
+	if intent.Valid() {
+		return intent, nil
+	}
+	return "", fmt.Errorf("invalid OpenCode background-subagent intent %q (valid values: auto, on, off)", raw)
+}
+
+// PiBackgroundIntent is Pi's unresolved auto/on/off background-subagent
+// preference. It deliberately mirrors OpenCodeBackgroundIntent instead of
+// generalizing it: each type's JSON state key is baked into persisted state
+// files, so sharing one type would couple two independent persistence
+// contracts.
+type PiBackgroundIntent string
+
+const (
+	PiBackgroundAuto PiBackgroundIntent = "auto"
+	PiBackgroundOn   PiBackgroundIntent = "on"
+	PiBackgroundOff  PiBackgroundIntent = "off"
+)
+
+func (i PiBackgroundIntent) Valid() bool {
+	return i == PiBackgroundAuto || i == PiBackgroundOn || i == PiBackgroundOff
+}
+
+// ParsePiBackgroundIntent validates the persisted and user-supplied control
+// vocabulary without selecting a runtime behavior.
+func ParsePiBackgroundIntent(raw string) (PiBackgroundIntent, error) {
+	intent := PiBackgroundIntent(raw)
+	if intent.Valid() {
+		return intent, nil
+	}
+	return "", fmt.Errorf("invalid Pi background-subagent intent %q (valid values: auto, on, off)", raw)
+}
 
 const (
 	AgentClaudeCode    AgentID = "claude-code"
@@ -66,33 +118,40 @@ const (
 type SkillID string
 
 const (
-	SkillSDDInit         SkillID = "sdd-init"
-	SkillSDDApply        SkillID = "sdd-apply"
-	SkillSDDVerify       SkillID = "sdd-verify"
-	SkillSDDExplore      SkillID = "sdd-explore"
-	SkillSDDPropose      SkillID = "sdd-propose"
-	SkillSDDSpec         SkillID = "sdd-spec"
-	SkillSDDDesign       SkillID = "sdd-design"
-	SkillSDDTasks        SkillID = "sdd-tasks"
-	SkillSDDArchive      SkillID = "sdd-archive"
-	SkillSDDOnboard      SkillID = "sdd-onboard"
-	SkillGoTesting       SkillID = "go-testing"
-	SkillCreator         SkillID = "skill-creator"
-	SkillImprover        SkillID = "skill-improver"
-	SkillJudgmentDay     SkillID = "judgment-day"
-	SkillBranchPR        SkillID = "branch-pr"
-	SkillIssueCreation   SkillID = "issue-creation"
-	SkillSkillRegistry   SkillID = "skill-registry"
-	SkillChainedPR       SkillID = "chained-pr"
-	SkillCognitiveDoc    SkillID = "cognitive-doc-design"
-	SkillCommentWriter   SkillID = "comment-writer"
-	SkillWorkUnitCommits SkillID = "work-unit-commits"
+	SkillSDDInit             SkillID = "sdd-init"
+	SkillSDDApply            SkillID = "sdd-apply"
+	SkillSDDVerify           SkillID = "sdd-verify"
+	SkillSDDExplore          SkillID = "sdd-explore"
+	SkillSDDResearch         SkillID = "sdd-research"
+	SkillSDDPropose          SkillID = "sdd-propose"
+	SkillSDDSpec             SkillID = "sdd-spec"
+	SkillSDDDesign           SkillID = "sdd-design"
+	SkillSDDTasks            SkillID = "sdd-tasks"
+	SkillSDDArchive          SkillID = "sdd-archive"
+	SkillSDDOnboard          SkillID = "sdd-onboard"
+	SkillGoTesting           SkillID = "go-testing"
+	SkillCreator             SkillID = "skill-creator"
+	SkillImprover            SkillID = "skill-improver"
+	SkillJudgmentDay         SkillID = "judgment-day"
+	SkillBranchPR            SkillID = "branch-pr"
+	SkillIssueCreation       SkillID = "issue-creation"
+	SkillSkillRegistry       SkillID = "skill-registry"
+	SkillChainedPR           SkillID = "chained-pr"
+	SkillCognitiveDoc        SkillID = "cognitive-doc-design"
+	SkillCommentWriter       SkillID = "comment-writer"
+	SkillWorkUnitCommits     SkillID = "work-unit-commits"
+	SkillRDDDefectWorkflow   SkillID = "rdd-defect-workflow"
+	SkillSystemicIssueTriage SkillID = "systemic-issue-triage"
+	SkillGentleAIBench       SkillID = "gentle-ai-bench"
 )
 
 type PersonaID string
 
 const (
-	PersonaGentleman                 PersonaID = "gentleman"
+	PersonaGentleman PersonaID = "gentleman"
+	// PersonaGentlemanNeutralArtifacts is a legacy alias accepted for backward
+	// compatibility. The CLI and sync normalization treat it as PersonaNeutral,
+	// and it is never offered as a selectable choice.
 	PersonaGentlemanNeutralArtifacts PersonaID = "gentleman-neutral-artifacts"
 	PersonaNeutral                   PersonaID = "neutral"
 	PersonaCustom                    PersonaID = "custom"
@@ -175,6 +234,12 @@ const (
 	OpenCodePluginGentleLogo         OpenCodeCommunityPluginID = "gentle-logo"
 )
 
+type CommunityToolID string
+
+const (
+	CommunityToolCodeGraph CommunityToolID = "codegraph"
+)
+
 // Profile represents a named SDD orchestrator configuration with model assignments.
 // The default profile (Name="" or Name="default") maps to the base sdd-orchestrator.
 // Named profiles generate sdd-orchestrator-{Name} + suffixed sub-agents.
@@ -182,58 +247,4 @@ type Profile struct {
 	Name              string                     // e.g. "cheap", "premium"; empty = default
 	OrchestratorModel ModelAssignment            // orchestrator model
 	PhaseAssignments  map[string]ModelAssignment // key = phase name (e.g. "sdd-apply")
-}
-
-// TriggerEvent is the closed set of lifecycle moments the orchestrator is told
-// to recognize. These are SEMANTIC moments honored by the AI orchestrator, not
-// OS-level hooks. gentle-ai never fires them.
-type TriggerEvent string
-
-const (
-	EventPreCommit    TriggerEvent = "pre-commit"
-	EventPrePush      TriggerEvent = "pre-push"
-	EventPrePR        TriggerEvent = "pre-pr"
-	EventPostSDDPhase TriggerEvent = "post-sdd-phase"
-	EventOnCI         TriggerEvent = "on-ci"
-	EventOnSchedule   TriggerEvent = "on-schedule"
-)
-
-// TriggerMode is the recommendation strength. Organic-only: "strong" is the
-// strongest level — a firm recommendation, NOT a hard gate.
-type TriggerMode string
-
-const (
-	ModeAdvisory TriggerMode = "advisory"
-	ModeStrong   TriggerMode = "strong"
-)
-
-// TriggerWhen is a structured, NON-evaluated condition. gentle-ai renders it to
-// plain instruction text; the orchestrator interprets it. The vocabulary is
-// deliberately tiny and documented so it cannot drift per agent.
-type TriggerWhen struct {
-	Always       bool     `json:"always,omitempty"`         // "on every occurrence"
-	PathGlobs    []string `json:"path_globs,omitempty"`     // diff touches any of these
-	MinDiffLines int      `json:"min_diff_lines,omitempty"` // diff exceeds N changed lines
-	Phases       []string `json:"phases,omitempty"`         // for post-sdd-phase: design, apply, ...
-	Combine      string   `json:"combine,omitempty"`        // "or" (default) | "and"
-}
-
-// TriggerBinding maps an event to one or more agents under a condition, with a
-// recommendation strength and a one-line rationale rendered into the directive.
-// On, When, Run, and Mode are REQUIRED. Reason is OPTIONAL and is the ONLY
-// permitted optional binding field: it carries the per-binding token-budget
-// justification and is rendered into the directive when present.
-type TriggerBinding struct {
-	On     TriggerEvent `json:"on"`
-	When   TriggerWhen  `json:"when"`
-	Run    []string     `json:"run"`              // agent names: review-risk, judgment-day, etc.
-	Mode   TriggerMode  `json:"mode"`
-	Reason string       `json:"reason,omitempty"` // OPTIONAL — token-budget/why note; only optional binding field
-}
-
-// TriggerRuleSet is the whole declarative layer: the closed events catalog plus
-// the ordered bindings. One set is rendered per agent.
-type TriggerRuleSet struct {
-	Events   []TriggerEvent   `json:"events"`
-	Bindings []TriggerBinding `json:"bindings"`
 }

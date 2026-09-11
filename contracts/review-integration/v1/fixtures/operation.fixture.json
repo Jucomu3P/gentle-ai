@@ -1,0 +1,14 @@
+{
+  "schema": "gentle-ai.review-integration.operation/v1",
+  "contract": "gentle-ai.review-integration/v1",
+  "operation": "review.validate",
+  "result": {
+    "schema": "gentle-ai.review-gate-result/v1",
+    "result": "allow",
+    "allowed": true,
+    "action": "repository-policy",
+    "reason": "delivery follows ordinary repository policy",
+    "context": {"gate": "pre-commit"},
+    "delivery": "unmanaged"
+  }
+}

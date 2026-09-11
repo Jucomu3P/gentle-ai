@@ -8,11 +8,11 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/gentleman-programming/gentle-ai/internal/system"
-	"github.com/gentleman-programming/gentle-ai/internal/versions"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/system"
 )
 
 func TestDetect(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
 	tests := []struct {
 		name            string
 		lookPathPath    string
@@ -105,26 +105,33 @@ func TestInstallCommand(t *testing.T) {
 		{
 			name:    "ubuntu resolves npm install",
 			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroUbuntu, PackageManager: "apt"},
-			want:    [][]string{{"sudo", "npm", "install", "-g", "--ignore-scripts", "opencode-ai@" + versions.OpenCode}},
+			want:    [][]string{{"sudo", "npm", "install", "-g", "--ignore-scripts", "opencode-ai@latest"}},
 		},
 		{
 			name:    "arch resolves npm install",
 			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroArch, PackageManager: "pacman"},
-			want:    [][]string{{"sudo", "npm", "install", "-g", "--ignore-scripts", "opencode-ai@" + versions.OpenCode}},
+			want:    [][]string{{"sudo", "npm", "install", "-g", "--ignore-scripts", "opencode-ai@latest"}},
 		},
 		{
 			name:    "fedora resolves npm install",
 			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroFedora, PackageManager: "dnf"},
-			want:    [][]string{{"sudo", "npm", "install", "-g", "--ignore-scripts", "opencode-ai@" + versions.OpenCode}},
+			want:    [][]string{{"sudo", "npm", "install", "-g", "--ignore-scripts", "opencode-ai@latest"}},
 		},
 		{
 			name:    "fedora with writable npm skips sudo",
 			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroFedora, PackageManager: "dnf", NpmWritable: true},
-			want:    [][]string{{"npm", "install", "-g", "--ignore-scripts", "opencode-ai@" + versions.OpenCode}},
+			want:    [][]string{{"npm", "install", "-g", "--ignore-scripts", "opencode-ai@latest"}},
 		},
 		{
-			name:    "unsupported package manager returns error",
-			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroUbuntu, PackageManager: "zypper"},
+			// Issue #2499: the probe (#2493) accepts any Linux package manager
+			// on PATH, so zypper resolves like every other probed manager.
+			name:    "opensuse resolves npm install",
+			profile: system.PlatformProfile{OS: "linux", LinuxDistro: "opensuse-leap", PackageManager: "zypper"},
+			want:    [][]string{{"sudo", "npm", "install", "-g", "--ignore-scripts", "opencode-ai@latest"}},
+		},
+		{
+			name:    "linux without package manager returns error",
+			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroUbuntu, PackageManager: ""},
 			wantErr: true,
 		},
 	}
@@ -144,5 +151,103 @@ func TestInstallCommand(t *testing.T) {
 				t.Fatalf("InstallCommand() = %v, want %v", command, tt.want)
 			}
 		})
+	}
+}
+
+func TestConfigPathsRespectXDGConfigHome(t *testing.T) {
+	home := t.TempDir()
+	xdg := filepath.Join(t.TempDir(), "xdg")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	a := NewAdapter()
+	wantDir := filepath.Join(xdg, "opencode")
+
+	if got := a.GlobalConfigDir(home); got != wantDir {
+		t.Fatalf("GlobalConfigDir() = %q, want %q", got, wantDir)
+	}
+	if got := a.SettingsPath(home); got != filepath.Join(wantDir, "opencode.json") {
+		t.Fatalf("SettingsPath() = %q, want XDG path", got)
+	}
+	if got := a.SystemPromptFile(home); got != filepath.Join(wantDir, "AGENTS.md") {
+		t.Fatalf("SystemPromptFile() = %q, want XDG path", got)
+	}
+	if got := a.SystemPromptDir(home); got != wantDir {
+		t.Fatalf("SystemPromptDir() = %q, want %q", got, wantDir)
+	}
+	if got := a.SkillsDir(home); got != filepath.Join(wantDir, "skills") {
+		t.Fatalf("SkillsDir() = %q, want XDG path", got)
+	}
+	if got := a.CommandsDir(home); got != filepath.Join(wantDir, "commands") {
+		t.Fatalf("CommandsDir() = %q, want XDG path", got)
+	}
+	if got := a.MCPConfigPath(home, "codegraph"); got != filepath.Join(wantDir, "opencode.json") {
+		t.Fatalf("MCPConfigPath() = %q, want XDG path", got)
+	}
+}
+
+func TestSettingsPathIgnoresNonRegularJSONC(t *testing.T) {
+	home := t.TempDir()
+	xdg := filepath.Join(t.TempDir(), "xdg")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	configDir := filepath.Join(xdg, "opencode")
+	if err := os.MkdirAll(filepath.Join(configDir, "opencode.jsonc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(opencode.jsonc directory) error = %v", err)
+	}
+
+	if got, want := NewAdapter().SettingsPath(home), filepath.Join(configDir, "opencode.json"); got != want {
+		t.Fatalf("SettingsPath() = %q, want %q", got, want)
+	}
+}
+
+func TestEffectiveCodeGraphWiring(t *testing.T) {
+	tests := []struct {
+		name       string
+		fileName   string
+		content    string
+		configured bool
+	}{
+		{name: "effective JSON", fileName: "opencode.json", content: `{"mcp":{"codegraph":{"type":"local","command":["codegraph","serve","--mcp"],"enabled":true}}}`, configured: true},
+		{name: "effective JSONC", fileName: "opencode.jsonc", content: "{\n// preserved comment\n\"mcp\": {\"codegraph\": {\"type\": \"local\", \"command\": [\"codegraph\", \"serve\", \"--mcp\"],},},\n}", configured: true},
+		{name: "disabled entry", fileName: "opencode.json", content: `{"mcp":{"codegraph":{"type":"local","command":["codegraph","serve","--mcp"],"enabled":false}}}`},
+		{name: "wrong command", fileName: "opencode.json", content: `{"mcp":{"codegraph":{"type":"local","command":["other","serve","--mcp"]}}}`},
+		{name: "malformed config", fileName: "opencode.json", content: `{"mcp":`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("XDG_CONFIG_HOME", "")
+			path := filepath.Join(ConfigPath(home), tt.fileName)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			gotPath, configured := NewAdapter().EffectiveCodeGraphWiring(home)
+			if configured != tt.configured {
+				t.Fatalf("EffectiveCodeGraphWiring() configured = %v, want %v", configured, tt.configured)
+			}
+			if configured && gotPath != path {
+				t.Fatalf("EffectiveCodeGraphWiring() path = %q, want %q", gotPath, path)
+			}
+		})
+	}
+}
+
+func TestConfigPathIgnoresRelativeXDGConfigHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join("relative", "config"))
+	want := filepath.Join(home, ".config", "opencode")
+	if got := ConfigPath(home); got != want {
+		t.Fatalf("ConfigPath() = %q, want fallback %q", got, want)
 	}
 }

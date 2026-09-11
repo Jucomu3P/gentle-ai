@@ -6,26 +6,23 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/gentleman-programming/gentle-ai/internal/model"
-	"github.com/gentleman-programming/gentle-ai/internal/tui/styles"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/tui/styles"
 )
 
 // CodexModelPreset represents a named effort-tier preset for Codex per-phase
-// reasoning_effort assignments. Each preset corresponds to a ChatGPT plan tier.
+// reasoning_effort assignments. Efforts are Gentle AI workload policy, not Codex defaults.
 type CodexModelPreset string
 
 const (
-	// CodexPresetLowCost targets ChatGPT Plus ($20/mo) — minimal effort to
-	// stay within the plan's tight usage limits.
-	CodexPresetLowCost CodexModelPreset = "low-cost"
+	// CodexPresetLowCost minimizes delegated workload effort.
+	CodexPresetLowCost CodexModelPreset = CodexModelPreset(model.CodexPresetLowCost)
 
-	// CodexPresetRecommended targets ChatGPT Pro ($100/mo) — balanced effort
-	// for most SDD work. This is the default preset.
-	CodexPresetRecommended CodexModelPreset = "recommended"
+	// CodexPresetRecommended balances quality and usage. This is the default preset.
+	CodexPresetRecommended CodexModelPreset = CodexModelPreset(model.CodexPresetRecommended)
 
-	// CodexPresetPowerful targets ChatGPT Pro ($200/mo) — xhigh effort for
-	// architecture-heavy and review-heavy phases.
-	CodexPresetPowerful CodexModelPreset = "powerful"
+	// CodexPresetPowerful uses high effort for reasoning-heavy and coding phases.
+	CodexPresetPowerful CodexModelPreset = CodexModelPreset(model.CodexPresetPowerful)
 )
 
 var codexPresetOrder = []CodexModelPreset{
@@ -35,9 +32,9 @@ var codexPresetOrder = []CodexModelPreset{
 }
 
 var codexPresetDescriptions = map[CodexModelPreset]string{
-	CodexPresetLowCost:     "Minimal effort — preserves tight ChatGPT Plus ($20/mo) usage limits",
-	CodexPresetRecommended: "Balanced effort — high on key phases, low on lightweight work (Pro $100/mo)",
-	CodexPresetPowerful:    "Maximum effort — xhigh on architecture, design, and verification (Pro $200/mo)",
+	CodexPresetLowCost:     "Lowest-cost GPT-5.6 mix — Terra for work, Luna for lightweight phases",
+	CodexPresetRecommended: "Balanced GPT-5.6 mix — Sol for reasoning, Terra for code, Luna for light work",
+	CodexPresetPowerful:    "High-effort GPT-5.6 mix — Sol for reasoning, Terra for code, Luna for light work",
 }
 
 var codexPresetConstructors = map[CodexModelPreset]func() map[string]model.CodexEffort{
@@ -49,7 +46,7 @@ var codexPresetConstructors = map[CodexModelPreset]func() map[string]model.Codex
 // codexCustomPhases is the ordered list of the 13 SDD phases for the Custom
 // per-phase model picker. Order matches codexTierGroups phase groupings.
 var codexCustomPhases = []string{
-	"sdd-explore", "sdd-propose", "sdd-spec", "sdd-design", "sdd-tasks",
+	"sdd-explore", "sdd-research", "sdd-propose", "sdd-spec", "sdd-design", "sdd-tasks",
 	"sdd-apply", "sdd-verify", "sdd-archive", "sdd-onboard",
 	"jd-judge-a", "jd-judge-b", "jd-fix-agent", "default",
 }
@@ -87,6 +84,7 @@ type CodexModelPickerState struct {
 	CustomModelCursor  int                              // cursor position in filtered model list
 	CustomEffortCursor int                              // cursor position in effort list
 	CustomPendingModel string                           // model ID selected in model-select (pending effort)
+	AvailableModels    []string                         // discovered model IDs for Custom mode
 	CustomAssignments  map[string]CodexCustomAssignment // phase → assignment
 	CustomConfirmed    bool                             // true after user presses Confirm
 }
@@ -95,6 +93,7 @@ type CodexModelPickerState struct {
 func NewCodexModelPickerState() CodexModelPickerState {
 	return CodexModelPickerState{
 		Preset:            CodexPresetRecommended,
+		AvailableModels:   model.CodexAvailableModels(),
 		CustomAssignments: make(map[string]CodexCustomAssignment),
 	}
 }
@@ -108,10 +107,12 @@ func NewCodexModelPickerStateFromAssignments(assignments map[string]model.CodexE
 	if len(assignments) == 0 {
 		return NewCodexModelPickerState()
 	}
-	for preset, constructor := range codexPresetConstructors {
+	for _, preset := range codexPresetOrder {
+		constructor := codexPresetConstructors[preset]
 		if codexAssignmentsEqual(constructor(), assignments) {
 			return CodexModelPickerState{
 				Preset:            preset,
+				AvailableModels:   model.CodexAvailableModels(),
 				CustomAssignments: make(map[string]CodexCustomAssignment),
 			}
 		}
@@ -119,6 +120,7 @@ func NewCodexModelPickerStateFromAssignments(assignments map[string]model.CodexE
 	// Unknown assignments → fall back to Recommended.
 	return CodexModelPickerState{
 		Preset:            CodexPresetRecommended,
+		AvailableModels:   model.CodexAvailableModels(),
 		CustomAssignments: make(map[string]CodexCustomAssignment),
 	}
 }
@@ -135,6 +137,14 @@ func codexAssignmentsEqual(a, b map[string]model.CodexEffort) bool {
 	return true
 }
 
+func filteredCodexModels(state CodexModelPickerState) []string {
+	models := state.AvailableModels
+	if len(models) == 0 {
+		models = model.CodexAvailableModels()
+	}
+	return model.FilterCodexModelList(models, state.CustomModelSearch)
+}
+
 // CodexModelPickerOptionCount returns the total number of selectable rows based
 // on the active sub-mode:
 //   - Main picker: 3 presets + Custom + Back = 5
@@ -146,7 +156,7 @@ func CodexModelPickerOptionCount(state CodexModelPickerState) int {
 	case CodexCustomModePhaseList:
 		return len(codexCustomPhases) + 1 // phases + Confirm
 	case CodexCustomModeModelSelect:
-		models := model.FilterCodexModels(state.CustomModelSearch)
+		models := filteredCodexModels(state)
 		if len(models) == 0 {
 			return 0
 		}
@@ -195,6 +205,7 @@ func HandleCodexModelPickerNav(
 
 	// Custom row: index len(codexPresetOrder) = 3.
 	if cursor == len(codexPresetOrder) {
+		state.AvailableModels = model.CodexAvailableModels()
 		state.CustomMode = CodexCustomModePhaseList
 		state.CustomPhaseIdx = 0
 		state.CustomModelSearch = ""
@@ -284,7 +295,8 @@ func handleCustomPhaseListNav(key string, state *CodexModelPickerState, cursor i
 }
 
 func handleCustomModelSelectNav(key string, state *CodexModelPickerState) (bool, map[string]model.CodexEffort) {
-	models := model.FilterCodexModels(state.CustomModelSearch)
+	models := filteredCodexModels(*state)
+	state.CustomModelCursor = min(max(0, state.CustomModelCursor), max(0, len(models)-1))
 
 	switch key {
 	case "up", "k":
@@ -485,7 +497,7 @@ func renderCodexCustomModelSelect(state CodexModelPickerState) string {
 	b.WriteString(styles.SubtextStyle.Render("Search: " + codexModelSearchDisplay(state.CustomModelSearch)))
 	b.WriteString("\n\n")
 
-	models := model.FilterCodexModels(state.CustomModelSearch)
+	models := filteredCodexModels(state)
 	cursor := state.CustomModelCursor
 	if cursor >= len(models) && len(models) > 0 {
 		cursor = len(models) - 1
@@ -546,18 +558,38 @@ func codexModelSearchDisplay(query string) string {
 // Labels are self-describing: they include the model id and effort tier per
 // carril so the user can see what will be written to profile files.
 //
-// Format: "<Plan> — Razonamiento gpt-5.5/<effort> · Código gpt-5.5/<effort> · Liviano gpt-5.4-mini/low"
+// Every preset runs the main orchestrator at medium effort, but not on the
+// same model: low-cost runs it on gpt-5.6-terra. The label reads the real
+// assignment rather than restating a policy that no longer holds uniformly.
+// Format: "<Plan> — Orquestador <model>/<effort> · Razonamiento <model>/<effort> · Código <model>/<effort> · Liviano <model>/<effort>"
 func CodexPresetLabel(preset CodexModelPreset) string {
+	defaults := model.CodexPresetCarrilDefaults(string(preset))
+	strong := defaults["sdd-strong"]
+	mid := defaults["sdd-mid"]
+	cheap := defaults["sdd-cheap"]
+
+	plan := string(preset)
 	switch preset {
 	case CodexPresetLowCost:
-		return "Plus $20 — Razonamiento gpt-5.5/medium · Código gpt-5.5/medium · Liviano gpt-5.4-mini/low"
+		plan = "Low-cost"
 	case CodexPresetRecommended:
-		return "Pro $100 — Razonamiento gpt-5.5/high · Código gpt-5.5/medium · Liviano gpt-5.4-mini/low"
+		plan = "Recommended"
 	case CodexPresetPowerful:
-		return "Pro $200 — Razonamiento gpt-5.5/xhigh · Código gpt-5.5/high · Liviano gpt-5.4-mini/low"
-	default:
-		return string(preset)
+		plan = "Powerful"
 	}
+
+	orchestrator := model.CodexPresetOrchestratorAssignment(string(preset))
+	return fmt.Sprintf("%s — Orquestador %s/%s · Razonamiento %s/%s · Código %s/%s · Liviano %s/%s",
+		plan,
+		orchestrator.Model,
+		orchestrator.Effort,
+		strong.Model,
+		strong.Effort,
+		mid.Model,
+		mid.Effort,
+		cheap.Model,
+		cheap.Effort,
+	)
 }
 
 // CodexPresetDescription returns a one-line description for a preset.

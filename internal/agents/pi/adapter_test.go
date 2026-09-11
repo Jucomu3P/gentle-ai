@@ -2,13 +2,16 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
-	"github.com/gentleman-programming/gentle-ai/internal/model"
-	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/system"
 )
 
 func TestAdapterIdentityAndCapabilities(t *testing.T) {
@@ -26,7 +29,6 @@ func TestAdapterIdentityAndCapabilities(t *testing.T) {
 		got  bool
 		want bool
 	}{
-		{"SupportsAutoInstall", a.SupportsAutoInstall(), true},
 		{"SupportsSkills", a.SupportsSkills(), false},
 		{"SupportsMCP", a.SupportsMCP(), true},
 		{"SupportsSystemPrompt", a.SupportsSystemPrompt(), false},
@@ -56,8 +58,8 @@ func TestAdapterPaths(t *testing.T) {
 		want string
 	}{
 		{"GlobalConfigDir", a.GlobalConfigDir(homeDir), piDir},
-		{"SystemPromptDir", a.SystemPromptDir(homeDir), ""},
-		{"SystemPromptFile", a.SystemPromptFile(homeDir), ""},
+		{"SystemPromptDir", a.SystemPromptDir(homeDir), piAgentDir},
+		{"SystemPromptFile", a.SystemPromptFile(homeDir), filepath.Join(piAgentDir, "APPEND_SYSTEM.md")},
 		{"SkillsDir", a.SkillsDir(homeDir), ""},
 		{"SettingsPath", a.SettingsPath(homeDir), filepath.Join(piAgentDir, "settings.json")},
 		{"CommandsDir", a.CommandsDir(homeDir), ""},
@@ -76,9 +78,123 @@ func TestAdapterPaths(t *testing.T) {
 	}
 }
 
+func TestCodeGraphPathsResolveConfiguredAgentDirectory(t *testing.T) {
+	home := t.TempDir()
+	configured := filepath.Join(home, "custom-pi")
+	t.Setenv("PI_CODING_AGENT_DIR", configured)
+
+	paths := CodeGraphPaths(home)
+	if paths.AgentDir != configured {
+		t.Fatalf("AgentDir = %q, want %q", paths.AgentDir, configured)
+	}
+	if paths.MCPConfig != filepath.Join(configured, "mcp.json") {
+		t.Fatalf("MCPConfig = %q", paths.MCPConfig)
+	}
+	if paths.Manifest != filepath.Join(home, ".gentle-ai", "pi-codegraph.json") {
+		t.Fatalf("Manifest = %q", paths.Manifest)
+	}
+}
+
+func TestCodeGraphPathsKeepsAgentDirectoryWhenProjectMCPOverrides(t *testing.T) {
+	home := t.TempDir()
+	configured := filepath.Join(home, "custom-pi")
+	workspace := filepath.Join(home, "project")
+	t.Setenv("PI_CODING_AGENT_DIR", configured)
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, ".mcp.json"), []byte(`{"mcpServers":{"codegraph":{}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	paths := CodeGraphPaths(home)
+	effective, err := EffectiveCodeGraphMCPPath(home, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths.AgentDir != configured || effective != filepath.Join(workspace, ".mcp.json") {
+		t.Fatalf("agent=%q effective=%q, want configured agent and project config", paths.AgentDir, effective)
+	}
+}
+
+func TestDiscoverCodeGraphChildrenUsesProjectOverrideAndPreservesPackageSource(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "project")
+	mustWrite := func(path, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite(filepath.Join(home, ".pi", "agent", "subagents", "worker.md"), "---\ntools: bash\n---\npackage worker\n")
+	mustWrite(filepath.Join(workspace, ".pi", "subagents", "worker.md"), "---\ntools: bash, mcp\n---\nproject worker\n")
+	mustWrite(filepath.Join(home, ".pi", "agent", "agents", "reader.md"), "---\ntools: read\n---\nreader\n")
+	mustWrite(filepath.Join(home, ".pi", "agent", "node_modules", "gentle-pi", "subagents", "package-worker.md"), "---\ntools: bash\n---\npackage worker\n")
+
+	children, err := DiscoverCodeGraphChildren(home, workspace)
+	if err != nil {
+		t.Fatalf("DiscoverCodeGraphChildren() error = %v", err)
+	}
+	if len(children) != 3 {
+		t.Fatalf("children = %#v, want three effective children", children)
+	}
+	if children[0].Name != "package-worker" || children[1].Name != "reader" || children[2].Name != "worker" {
+		t.Fatalf("children = %#v, want sorted package-worker, reader, and worker", children)
+	}
+	if !children[0].PackageOwned || children[0].Target == children[0].Source {
+		t.Fatalf("package worker = %#v, want owned overlay", children[0])
+	}
+	if children[2].Source != filepath.Join(workspace, ".pi", "subagents", "worker.md") || children[2].PackageOwned {
+		t.Fatalf("worker = %#v, want project effective child", children[2])
+	}
+}
+
+func TestDiscoverCodeGraphChildrenReturnsUnreadableDirectoryError(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".pi", "agent", "subagents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := piWalkDir
+	piWalkDir = func(path string, walkFn fs.WalkDirFunc) error {
+		return &fs.PathError{Op: "readdir", Path: path, Err: fs.ErrPermission}
+	}
+	t.Cleanup(func() { piWalkDir = previous })
+
+	_, err := DiscoverCodeGraphChildren(home, "")
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("DiscoverCodeGraphChildren() error = %v, want unreadable-directory error", err)
+	}
+}
+
+func TestDiscoverCodeGraphChildrenUsesNormalizedRuntimeIdentity(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "project")
+	for path, body := range map[string]string{
+		filepath.Join(home, ".pi", "agent", "subagents", "Worker.md"): "---\ntools: bash\n---\nuser\n",
+		filepath.Join(workspace, ".pi", "subagents", "worker.md"):     "---\ntools: bash\n---\nproject\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	children, err := DiscoverCodeGraphChildren(home, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].Source != filepath.Join(workspace, ".pi", "subagents", "worker.md") {
+		t.Fatalf("children = %#v, want one project runtime identity", children)
+	}
+}
+
 func TestAdapterDetectUsesPiBinaryAndConfigPath(t *testing.T) {
 	homeDir := t.TempDir()
-	configDir := filepath.Join(homeDir, ".pi")
+	configDir := filepath.Join(homeDir, ".pi", "agent")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -130,11 +246,30 @@ func TestAdapterDetectMissingPiBinary(t *testing.T) {
 	if binaryPath != "" {
 		t.Fatalf("Detect() binaryPath = %q, want empty", binaryPath)
 	}
-	if configPath != filepath.Join(homeDir, ".pi") {
-		t.Fatalf("Detect() configPath = %q, want ~/.pi under home", configPath)
+	if configPath != filepath.Join(homeDir, ".pi", "agent") {
+		t.Fatalf("Detect() configPath = %q, want ~/.pi/agent under home", configPath)
 	}
 	if configFound {
 		t.Fatalf("Detect() configFound = true, want false")
+	}
+}
+
+func TestManagedPackageSourcesReturnsCanonicalCopy(t *testing.T) {
+	want := []string{
+		"npm:gentle-pi",
+		"npm:gentle-engram",
+		"npm:pi-mcp-adapter",
+		"npm:@juicesharp/rpiv-ask-user-question",
+		"npm:pi-web-access",
+		"npm:pi-btw",
+	}
+	got := ManagedPackageSources()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ManagedPackageSources() = %v, want %v", got, want)
+	}
+	got[0] = "changed"
+	if sources := ManagedPackageSources(); sources[0] != want[0] {
+		t.Fatalf("ManagedPackageSources() exposed mutable adapter state: %v", sources)
 	}
 }
 
@@ -158,11 +293,8 @@ func TestAdapterInstallCommandSequenceUsesNpmWhenPnpmIsUnavailable(t *testing.T)
 		{"pi", "install", "npm:gentle-engram"},
 		{"pi", "install", "npm:pi-mcp-adapter"},
 		{"npm", "exec", "--yes", "--package", "gentle-engram@latest", "--", "pi-engram", "init"},
-		{"pi", "install", "npm:pi-subagents"},
-		{"pi", "install", "npm:pi-intercom"},
 		{"pi", "install", "npm:@juicesharp/rpiv-ask-user-question"},
 		{"pi", "install", "npm:pi-web-access"},
-		{"pi", "install", "npm:@juicesharp/rpiv-todo"},
 		{"pi", "install", "npm:pi-btw"},
 	}
 	if !reflect.DeepEqual(commands, want) {
@@ -170,7 +302,7 @@ func TestAdapterInstallCommandSequenceUsesNpmWhenPnpmIsUnavailable(t *testing.T)
 	}
 }
 
-func TestAdapterInstallCommandSequenceUsesPnpmForEngramInitWhenAvailable(t *testing.T) {
+func TestAdapterInstallCommandSequenceUsesNpmForEngramInitWhenPnpmIsAvailable(t *testing.T) {
 	a := &Adapter{
 		lookPath: func(file string) (string, error) {
 			if file == "pnpm" {
@@ -185,8 +317,106 @@ func TestAdapterInstallCommandSequenceUsesPnpmForEngramInitWhenAvailable(t *test
 		t.Fatalf("InstallCommand() error = %v", err)
 	}
 
-	want := []string{"pnpm", "dlx", "gentle-engram@latest", "pi-engram", "init"}
+	want := []string{"npm", "exec", "--yes", "--package", "gentle-engram@latest", "--", "pi-engram", "init"}
 	if !reflect.DeepEqual(commands[3], want) {
 		t.Fatalf("InstallCommand()[3] = %#v, want %#v", commands[3], want)
+	}
+}
+
+func TestAppendPiPackageKeepsSubagentsPackageWhileGentlePiIsPinnedBelowGentleAgents(t *testing.T) {
+	kept := appendPiPackage([]any{"npm:gentle-pi@2.4.0", "npm:pi-subagents-j0k3r@1.5.13"}, "npm:pi-mcp-adapter")
+	if !reflect.DeepEqual(kept, []any{"npm:gentle-pi@2.4.0", "npm:pi-subagents-j0k3r@1.5.13", "npm:pi-mcp-adapter"}) {
+		t.Fatalf("appendPiPackage() with an old gentle-pi pin = %v, want the subagents package kept", kept)
+	}
+	dropped := appendPiPackage([]any{"npm:gentle-pi@2.5.0", "npm:pi-subagents-j0k3r"}, "npm:pi-mcp-adapter")
+	if !reflect.DeepEqual(dropped, []any{"npm:gentle-pi@2.5.0", "npm:pi-mcp-adapter"}) {
+		t.Fatalf("appendPiPackage() with gentle-pi 2.5.0 = %v, want the subagents package dropped", dropped)
+	}
+}
+
+func TestMergePiSettingsFileRemovesRetiredCompanionPackages(t *testing.T) {
+	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".pi", "agent", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(settings dir) error = %v", err)
+	}
+	initial := `{
+  "packages": [
+    "npm:@juicesharp/rpiv-todo",
+    "npm:@juicesharp/rpiv-todo@2.9.0",
+    "npm:pi-subagents-j0k3r",
+    "npm:pi-subagents-j0k3r@1.5.13",
+    "npm:@juicesharp/rpiv-ask-user-question",
+    "npm:other@1.0.0"
+  ]
+}`
+	if err := os.WriteFile(settingsPath, []byte(initial), 0o644); err != nil {
+		t.Fatalf("WriteFile(settings) error = %v", err)
+	}
+
+	if _, err := mergePiSettingsFile(settingsPath); err != nil {
+		t.Fatalf("mergePiSettingsFile() error = %v", err)
+	}
+
+	var settings struct {
+		Packages []string `json:"packages"`
+	}
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(settings) error = %v", err)
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("Unmarshal(settings) error = %v", err)
+	}
+	if !reflect.DeepEqual(settings.Packages, []string{"npm:@juicesharp/rpiv-ask-user-question", "npm:other@1.0.0", "npm:pi-mcp-adapter"}) {
+		t.Fatalf("packages = %#v, want the retired todo and subagents-j0k3r packages gone and the rest untouched", settings.Packages)
+	}
+}
+
+func TestMergePiSettingsFileRemovesLegacySubagentPackages(t *testing.T) {
+	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".pi", "agent", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(settings dir) error = %v", err)
+	}
+	initial := `{
+  "theme": "kanagawa",
+  "packages": [
+    "npm:pi-subagents",
+    "npm:pi-subagents@1.0.0",
+    "vendor/pi-subagents",
+    "vendor/pi-subagents-fixed@0.0.1",
+    "npm:pi-web-access",
+    "npm:other@1.0.0"
+  ]
+}`
+	if err := os.WriteFile(settingsPath, []byte(initial), 0o644); err != nil {
+		t.Fatalf("WriteFile(settings) error = %v", err)
+	}
+
+	if _, err := mergePiSettingsFile(settingsPath); err != nil {
+		t.Fatalf("mergePiSettingsFile() error = %v", err)
+	}
+
+	var settings struct {
+		Packages []string `json:"packages"`
+	}
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(settings) error = %v", err)
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("Unmarshal(settings) error = %v", err)
+	}
+
+	for _, forbidden := range []string{"npm:pi-subagents", "npm:pi-subagents@1.0.0", "vendor/pi-subagents", "vendor/pi-subagents-fixed@0.0.1"} {
+		for _, pkg := range settings.Packages {
+			if pkg == forbidden {
+				t.Fatalf("packages still contains legacy subagent package %q: %#v", forbidden, settings.Packages)
+			}
+		}
+	}
+	if !reflect.DeepEqual(settings.Packages, []string{"npm:pi-web-access", "npm:other@1.0.0", "npm:pi-mcp-adapter"}) {
+		t.Fatalf("packages = %#v", settings.Packages)
 	}
 }

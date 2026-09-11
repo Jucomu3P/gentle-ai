@@ -7,7 +7,7 @@ Pi support installs the Gentleman harness as Pi packages, then lets Pi own its o
 ## Quick Start
 
 1. Install Pi and make sure `pi` is available on `PATH`.
-2. Install the Pi support stack from Gentle AI:
+2. Install the Pi support stack from Gentle AI™:
 
 ```bash
 gentle-ai install --agent pi
@@ -19,7 +19,7 @@ gentle-ai install --agent pi
 pi
 ```
 
-Gentle AI detects the `pi` binary first. If Pi is the only selected agent, the installer still provisions the real Engram component, but skips persona, ecosystem component selection, and Strict TDD prompts because `gentle-pi` owns those choices inside Pi.
+Gentle AI detects the `pi` binary first. If Pi is the only selected agent, the installer still provisions the real Engram™ component, but skips persona, ecosystem component selection, and Strict TDD prompts because `gentle-pi` owns those choices inside Pi. Gentle AI writes nothing into the Pi system prompt because `gentle-pi` owns it, so the review execution contract ships as `orchestration/pi.md` in the published provider contract bundle, which `gentle-pi` mirrors and injects at session start. Because `gentle-pi` owns that file, `install` and `sync` also remove any gentle-ai managed blocks an older build left in `~/.pi/agent/APPEND_SYSTEM.md`, including the routing guidance block; routing guidance is delivered to every other agent's system prompt, but Pi is skipped for that step too.
 
 ## Installed Packages
 
@@ -29,12 +29,9 @@ Gentle AI runs exactly these Pi setup steps:
 pi install npm:gentle-pi
 pi install npm:gentle-engram
 pi install npm:pi-mcp-adapter
-npm exec --yes --package gentle-engram@0.1.4 -- pi-engram init
-pi install npm:pi-subagents
-pi install npm:pi-intercom
+npm exec --yes --package gentle-engram@latest -- pi-engram init
 pi install npm:@juicesharp/rpiv-ask-user-question
 pi install npm:pi-web-access
-pi install npm:@juicesharp/rpiv-todo
 pi install npm:pi-btw
 ```
 
@@ -44,12 +41,11 @@ pi install npm:pi-btw
 | [`gentle-engram`](https://pi.dev/packages/gentle-engram) | Pi integration for Engram session memory and MCP tools. It is not the Engram binary itself.                               |
 | `pi-mcp-adapter`                                         | Lets Pi expose MCP servers, including Engram, through Pi's MCP runtime.                                                   |
 | `pi-engram init`                                         | Initializes the Pi Engram MCP config shape owned by `gentle-engram`.                                                      |
-| `pi-subagents`                                           | Runs SDD agents discovered from `.pi/agents/`.                                                                            |
-| `pi-intercom`                                            | Lets child agents ask the parent Pi session for decisions while chains run.                                               |
 | `@juicesharp/rpiv-ask-user-question`                     | Lets Pi child agents ask the active user session for clarification when they need human input.                            |
 | `pi-web-access`                                          | Adds web access tools for Pi.                                                                                             |
-| `@juicesharp/rpiv-todo`                                  | Adds todo/task tracking support for Pi sessions.                                                                          |
 | `pi-btw`                                                 | Adds BTW companion workflow support for Pi.                                                                               |
+
+Discovering and running SDD agents from `.pi/agents/` is provided by `gentle-pi`'s Gentle Agents, which ships the same `subagent_*` tools that the retired `npm:pi-subagents-j0k3r` package used to provide. Gentle AI no longer installs `pi-subagents-j0k3r`, and an existing entry is dropped from `settings.json` on the next install or update so Pi uninstalls it on its next package sync.
 
 `gentle-pi` owns Pi's runtime behavior. Its current harness enforces parent-only delegation triggers: delegate exploration after 4+ files, use one writer for multi-file changes, require fresh review before PRs, run fresh audits after incidents, and pause long monolithic sessions before they drift.
 
@@ -64,6 +60,45 @@ Files updated by Gentle AI's Engram provisioning:
 ```
 
 `gentle-engram` owns the MCP schema itself. The installer runs `pi-engram init`, which initializes Pi's Engram MCP config under the Pi agent config directory instead of having Gentle AI hand-write that file.
+
+## SDD Research Capability
+
+Gentle AI declares Pi's canonical research capability under
+`gentle-ai.sdd-research-capability/v1`. Admission requires **all grants** for the
+requested class, with exact lowercase names:
+
+| Class | Required grants |
+| --- | --- |
+| `documentation` | `fetch_content` |
+| `open-web` | `web_search`, `source_check`, `fetch_content`, `get_search_content` |
+
+The observed grants must match the class exactly. Order does not matter; missing,
+renamed, duplicate, or unexpected grants deny admission. None of the four
+open-web grants is optional. Unknown classes or schemas also deny admission,
+returning no verified grants and no claims. Bash, generic MCP access, package
+installation, and inherited tools are not substitutes for observed grants.
+Admission verifies tool grants only; it does not create source-backed claims.
+
+Downstream [`gentle-pi`](https://github.com/Gentleman-Programming/gentle-pi) owns
+runtime tool observation, child tool projection, and research execution. This
+upstream declaration neither installs new tools nor proves that a live Pi child
+can use them. A separate downstream runtime probe is still required to establish
+live research evidence.
+
+## Optional CodeGraph
+
+Select CodeGraph during Gentle AI installation to add its read-only MCP server to Pi. This integration is optional and owned entirely by Gentle AI; `gentle-pi` is not modified.
+
+| Area | Gentle AI behavior |
+| --- | --- |
+| MCP | Merges `mcpServers.codegraph` with `codegraph serve --mcp`; a conflicting user entry is reported, never overwritten. |
+| Children | Discovers effective user and project Pi child definitions. Compatible children (`bash` plus explicit tools) receive `mcp`; every readable child receives lazy-init guidance. |
+| Intelligence | Prefers `codegraph_explore`; when MCP is unavailable, guidance uses the upstream CLI's read-only intelligence commands directly rather than routing them through Gentle AI. |
+| Indexes | Guidance resolves a safe project root, initializes a missing `.codegraph/` once, relies on watcher auto-sync after edits, and uses `codegraph sync` only for stale/disabled-watcher recovery. Full rebuild and destructive/admin commands are excluded from routine agent use. |
+| Sync | `gentle-ai sync` reconciles the owned manifest after Pi assets refresh, restoring missing overlays without duplicates. This configuration sync is separate from upstream index freshness. |
+| Removal | Uninstall removes only manifest-owned MCP and child blocks. Drifted child files are preserved and reported for manual review. |
+
+Package-owned child files are never edited. Gentle AI creates a same-name overlay in Pi's agent directory when needed. A parent `APPEND_SYSTEM.md` CodeGraph marker is not considered proof that any child has CodeGraph tools or guidance.
 
 ## Pi Commands
 

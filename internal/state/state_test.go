@@ -4,9 +4,129 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
 )
+
+// TestWriteReconciledAcceptsDesiredStateVisibleAfterWriteError verifies that
+// a persistence error is reconciled against the bytes visible on disk.
+func TestWriteReconciledAcceptsDesiredStateVisibleAfterWriteError(t *testing.T) {
+	home := t.TempDir()
+	desired := InstallState{InstalledAgents: []string{"opencode"}}
+	if err := Write(home, desired); err != nil {
+		t.Fatal(err)
+	}
+	statePath := Path(home)
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, ".gentle-ai", "persisted-state.json")
+	if err := os.Rename(statePath, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, statePath); err != nil {
+		t.Skipf("state symlink unavailable: %v", err)
+	}
+
+	if err := WriteReconciled(home, desired); err != nil {
+		t.Fatalf("WriteReconciled() error = %v", err)
+	}
+	visible, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(visible) != string(data) {
+		t.Fatalf("visible state changed:\n got %s\nwant %s", visible, data)
+	}
+}
+
+func fullyPopulatedInstallState() InstallState {
+	lastUpdateCheck := time.Date(2026, 8, 12, 9, 30, 0, 0, time.UTC)
+	rddModeRecordedAt := time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC)
+	return InstallState{
+		InstalledAgents:          []string{"claude-code", "opencode"},
+		InstalledBinaryVersion:   "1.2.3",
+		ManagedAssetDigest:       "sha256:managed-assets",
+		SelectionConfigured:      true,
+		Components:               []model.ComponentID{model.ComponentEngram, model.ComponentSDD},
+		Skills:                   []model.SkillID{model.SkillSDDInit, model.SkillWorkUnitCommits},
+		Preset:                   model.PresetCustom,
+		SDDMode:                  model.SDDModeMulti,
+		StrictTDD:                true,
+		CommunityTools:           []string{"codegraph", "jq"},
+		CommunityToolsConfigured: true,
+		ClaudeModelAssignments:   map[string]string{"sdd-explore": "sonnet"},
+		ClaudePhaseAssignments: map[string]ClaudePhaseAssignmentState{
+			"sdd-apply": {Model: "opus", Effort: "max"},
+		},
+		KiroModelAssignments: map[string]string{"sdd-design": "opus"},
+		CodexModelAssignments: map[string]string{
+			"sdd-verify": "high",
+		},
+		CodexOrchestratorAssignment: &CodexOrchestratorAssignmentState{Model: "gpt-5.6-luna", Effort: "high"},
+		CodexCarrilModelAssignments: map[string]string{
+			"sdd-strong": "gpt-5.6-luna",
+			"sdd-cheap":  "gpt-5.4-mini",
+		},
+		CodexPhaseModelAssignments: map[string]string{
+			"sdd-propose": "gpt-5.6-sol",
+		},
+		ModelAssignments: map[string]ModelAssignmentState{
+			"sdd-init": {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "medium"},
+		},
+		Persona:           "neutral",
+		PersonaPresent:    true,
+		LastUpdateCheck:   &lastUpdateCheck,
+		PendingSync:       true,
+		RDDMode:           "off",
+		RDDModeRecordedAt: &rddModeRecordedAt,
+		BackgroundIntent:  model.OpenCodeBackgroundOn,
+	}
+}
+
+func TestInstallStatePreservesEveryField(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		run  func(t *testing.T, want InstallState) InstallState
+	}{
+		{
+			name: "JSON round-trip",
+			run: func(t *testing.T, want InstallState) InstallState {
+				home := t.TempDir()
+				if err := Write(home, want); err != nil {
+					t.Fatal(err)
+				}
+				got, err := Read(home)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return got
+			},
+		},
+		{
+			name: "MergeAgents",
+			run: func(_ *testing.T, want InstallState) InstallState {
+				return MergeAgents(want, []string{"opencode", "codex"})
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			want := fullyPopulatedInstallState()
+			wantAfter := want
+			if tt.name == "MergeAgents" {
+				wantAfter.InstalledAgents = []string{"claude-code", "opencode", "codex"}
+			}
+			got := tt.run(t, want)
+			if !reflect.DeepEqual(got, wantAfter) {
+				t.Fatalf("InstallState = %#v, want %#v", got, wantAfter)
+			}
+		})
+	}
+}
 
 // TestMergeAgents verifies that MergeAgents appends new agents to existing
 // installed_agents with deduplication and preserves all other fields.
@@ -16,6 +136,7 @@ func TestMergeAgents(t *testing.T) {
 	}
 	existingClaude := map[string]string{"sdd-explore": "sonnet", "sdd-archive": "haiku"}
 	existingKiro := map[string]string{"sdd-design": "opus"}
+	existingCommunityTools := []string{"codegraph"}
 
 	tests := []struct {
 		name      string
@@ -50,11 +171,13 @@ func TestMergeAgents(t *testing.T) {
 		{
 			name: "model_assignments preserved across merge",
 			existing: InstallState{
-				InstalledAgents:        []string{"opencode"},
-				ModelAssignments:       existingAssignments,
-				ClaudeModelAssignments: existingClaude,
-				KiroModelAssignments:   existingKiro,
-				Persona:                "gentleman",
+				InstalledAgents:          []string{"opencode"},
+				CommunityTools:           existingCommunityTools,
+				CommunityToolsConfigured: true,
+				ModelAssignments:         existingAssignments,
+				ClaudeModelAssignments:   existingClaude,
+				KiroModelAssignments:     existingKiro,
+				Persona:                  "gentleman",
 			},
 			newAgents: []string{"pi"},
 			wantIDs:   []string{"opencode", "pi"},
@@ -82,7 +205,47 @@ func TestMergeAgents(t *testing.T) {
 			if got.Persona != tt.existing.Persona {
 				t.Errorf("Persona not preserved: got %q, want %q", got.Persona, tt.existing.Persona)
 			}
+			if !reflect.DeepEqual(got.CommunityTools, tt.existing.CommunityTools) || got.CommunityToolsConfigured != tt.existing.CommunityToolsConfigured {
+				t.Errorf("CommunityTools not preserved: got (%v, %t), want (%v, %t)", got.CommunityTools, got.CommunityToolsConfigured, tt.existing.CommunityTools, tt.existing.CommunityToolsConfigured)
+			}
 		})
+	}
+}
+
+func TestCommunityToolsRoundTrip(t *testing.T) {
+	home := t.TempDir()
+	want := InstallState{
+		InstalledAgents:          []string{"opencode"},
+		CommunityTools:           []string{"codegraph"},
+		CommunityToolsConfigured: true,
+	}
+	if err := Write(home, want); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	got, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if !reflect.DeepEqual(got.CommunityTools, want.CommunityTools) || !got.CommunityToolsConfigured {
+		t.Fatalf("community tool state = (%v, %t), want (%v, true)", got.CommunityTools, got.CommunityToolsConfigured, want.CommunityTools)
+	}
+}
+
+func TestSelectionRoundTripPreservesPresenceAndExplicitEmpty(t *testing.T) {
+	tests := []InstallState{
+		{SelectionConfigured: true, Components: []model.ComponentID{model.ComponentSDD}, Skills: []model.SkillID{model.SkillSDDInit}, Preset: model.PresetCustom, SDDMode: model.SDDModeMulti, StrictTDD: true},
+		{SelectionConfigured: true, Components: []model.ComponentID{}, Skills: []model.SkillID{}, Preset: model.PresetCustom},
+		{InstalledAgents: []string{"opencode"}},
+	}
+	for i, want := range tests {
+		home := t.TempDir()
+		if err := Write(home, want); err != nil {
+			t.Fatal(err)
+		}
+		got, err := Read(home)
+		if err != nil || got.SelectionConfigured != want.SelectionConfigured || !slices.Equal(got.Components, want.Components) || !slices.Equal(got.Skills, want.Skills) || got.Preset != want.Preset || got.SDDMode != want.SDDMode || got.StrictTDD != want.StrictTDD {
+			t.Errorf("case %d selection = %#v, want %#v", i, got, want)
+		}
 	}
 }
 
@@ -145,6 +308,35 @@ func TestPersonaBackwardCompat(t *testing.T) {
 	}
 	if s.Persona != "" {
 		t.Errorf("Persona = %q, want empty for pre-feature state", s.Persona)
+	}
+}
+
+func TestPersonaPresenceDistinguishesOmittedAndExplicitEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		stateJSON   string
+		wantPresent bool
+	}{
+		{name: "omitted", stateJSON: `{"installed_agents":["pi"]}`, wantPresent: false},
+		{name: "explicit empty", stateJSON: `{"installed_agents":["pi"],"persona":""}`, wantPresent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.MkdirAll(filepath.Dir(Path(home)), 0o755); err != nil {
+				t.Fatalf("MkdirAll() error = %v", err)
+			}
+			if err := os.WriteFile(Path(home), []byte(tc.stateJSON), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			got, err := Read(home)
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			if got.PersonaPresent != tc.wantPresent {
+				t.Fatalf("PersonaPresent = %t, want %t", got.PersonaPresent, tc.wantPresent)
+			}
+		})
 	}
 }
 
@@ -225,6 +417,35 @@ func TestWriteOverwrite(t *testing.T) {
 	want := []string{"opencode", "gemini-cli"}
 	if !reflect.DeepEqual(s.InstalledAgents, want) {
 		t.Errorf("InstalledAgents after overwrite = %v, want %v", s.InstalledAgents, want)
+	}
+}
+
+func TestWriteFailurePreservesExistingState(t *testing.T) {
+	home := t.TempDir()
+	original := InstallState{InstalledAgents: []string{"opencode"}, Persona: "neutral", PersonaPresent: true}
+	if err := Write(home, original); err != nil {
+		t.Fatal(err)
+	}
+
+	statePath := Path(home)
+	stateTarget := filepath.Join(home, stateDir, "persisted-state.json")
+	if err := os.Rename(statePath, stateTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(stateTarget, statePath); err != nil {
+		t.Skipf("state symlink unavailable: %v", err)
+	}
+
+	err := Write(home, InstallState{InstalledAgents: []string{"claude-code"}})
+	if err == nil {
+		t.Fatal("Write() error = nil, want atomic replacement refusal")
+	}
+	got, readErr := Read(home)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !reflect.DeepEqual(got, original) {
+		t.Fatalf("state after failed Write() = %#v, want %#v", got, original)
 	}
 }
 
@@ -838,6 +1059,80 @@ func TestMergeAgents_PreservesPendingSync(t *testing.T) {
 	merged := MergeAgents(existing, []string{"opencode"})
 	if !merged.PendingSync {
 		t.Errorf("MergeAgents did not preserve PendingSync: got false, want true")
+	}
+}
+
+// TestRDDMode_RoundTrip verifies the global receipt-driven-development kill
+// switch survives a write/read cycle in uncommitted user state.
+func TestRDDMode_RoundTrip(t *testing.T) {
+	home := t.TempDir()
+	recorded := time.Now().UTC().Truncate(time.Second)
+	s := InstallState{
+		InstalledAgents:   []string{"claude-code"},
+		RDDMode:           "off",
+		RDDModeRecordedAt: &recorded,
+	}
+	if err := Write(home, s); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	got, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got.RDDMode != "off" {
+		t.Errorf("RDDMode = %q after round-trip, want %q", got.RDDMode, "off")
+	}
+	if got.RDDModeRecordedAt == nil || !got.RDDModeRecordedAt.Equal(recorded) {
+		t.Errorf("RDDModeRecordedAt = %v, want %v", got.RDDModeRecordedAt, recorded)
+	}
+	data, err := os.ReadFile(Path(home))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !contains(string(data), "rdd_mode") || !contains(string(data), "rdd_mode_recorded_at") {
+		t.Errorf("JSON must contain the rdd mode keys; got:\n%s", data)
+	}
+}
+
+// TestRDDMode_BackwardCompat verifies that state files written before the kill
+// switch existed still read cleanly with an unconfigured mode.
+func TestRDDMode_BackwardCompat(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, stateDir), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	legacy := `{"installed_agents":["claude-code"]}` + "\n"
+	if err := os.WriteFile(Path(home), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	s, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if s.RDDMode != "" || s.RDDModeRecordedAt != nil {
+		t.Errorf("legacy state = %q/%v, want an unconfigured global mode", s.RDDMode, s.RDDModeRecordedAt)
+	}
+	data, err := os.ReadFile(Path(home))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if contains(string(data), "rdd_mode") {
+		t.Error("reading legacy state must not rewrite it with rdd mode keys")
+	}
+}
+
+// TestMergeAgents_PreservesRDDMode verifies an incremental agent install never
+// silently drops the user's kill-switch choice.
+func TestMergeAgents_PreservesRDDMode(t *testing.T) {
+	recorded := time.Now().UTC()
+	existing := InstallState{
+		InstalledAgents:   []string{"claude-code"},
+		RDDMode:           "off",
+		RDDModeRecordedAt: &recorded,
+	}
+	merged := MergeAgents(existing, []string{"opencode"})
+	if merged.RDDMode != "off" || merged.RDDModeRecordedAt == nil || !merged.RDDModeRecordedAt.Equal(recorded) {
+		t.Errorf("MergeAgents dropped the global mode: %q/%v", merged.RDDMode, merged.RDDModeRecordedAt)
 	}
 }
 

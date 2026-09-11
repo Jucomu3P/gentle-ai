@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gentleman-programming/gentle-ai/internal/model"
-	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/model"
+	"github.com/gentleman-programming/gentle-ai/v2/internal/system"
 )
 
 func TestParseInstallFlagsSupportsCSVAndRepeated(t *testing.T) {
@@ -93,6 +93,21 @@ func TestNormalizeInstallFlagsDefaults(t *testing.T) {
 	}
 }
 
+func TestNormalizeInstallFlagsAcceptsBundledSkills(t *testing.T) {
+	input, err := NormalizeInstallFlags(InstallFlags{Skills: []string{
+		string(model.SkillSystemicIssueTriage),
+		string(model.SkillGentleAIBench),
+	}}, system.DetectionResult{})
+	if err != nil {
+		t.Fatalf("NormalizeInstallFlags() error = %v", err)
+	}
+
+	want := []model.SkillID{model.SkillSystemicIssueTriage, model.SkillGentleAIBench}
+	if !reflect.DeepEqual(input.Selection.Skills, want) {
+		t.Fatalf("skills = %v, want %v", input.Selection.Skills, want)
+	}
+}
+
 func TestNormalizeInstallFlagsChannelBeta(t *testing.T) {
 	input, err := NormalizeInstallFlags(InstallFlags{Channel: "beta"}, system.DetectionResult{})
 	if err != nil {
@@ -100,6 +115,38 @@ func TestNormalizeInstallFlagsChannelBeta(t *testing.T) {
 	}
 	if input.Channel != ChannelBeta {
 		t.Fatalf("Channel = %q, want %q", input.Channel, ChannelBeta)
+	}
+}
+
+func TestNormalizeInstallFlagsFullPresetCustomPersonaKeepsPresetPolish(t *testing.T) {
+	input, err := NormalizeInstallFlags(InstallFlags{
+		Preset:  string(model.PresetFullGentleman),
+		Persona: string(model.PersonaCustom),
+	}, system.DetectionResult{})
+	if err != nil {
+		t.Fatalf("NormalizeInstallFlags() error = %v", err)
+	}
+
+	for _, got := range input.Selection.Components {
+		if got == model.ComponentPersona {
+			t.Fatalf("components should not include persona for custom persona; got %#v", input.Selection.Components)
+		}
+		if got == model.ComponentTheme {
+			t.Fatalf("components should not include generic theme; got %#v", input.Selection.Components)
+		}
+	}
+
+	for _, want := range []model.ComponentID{model.ComponentClaudeTheme, model.ComponentOpenCodeGentleLogo} {
+		found := false
+		for _, got := range input.Selection.Components {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("components should include preset polish %q; got %#v", want, input.Selection.Components)
+		}
 	}
 }
 
@@ -118,7 +165,7 @@ func TestNormalizeInstallFlagsCustomAcceptsOptionalGentlemanInstallables(t *test
 	}
 }
 
-func TestNormalizeInstallFlagsPiOnlyDefaultsToEngramOnly(t *testing.T) {
+func TestNormalizeInstallFlagsPiOnlyDefaultsToEngramAndPersona(t *testing.T) {
 	input, err := NormalizeInstallFlags(InstallFlags{
 		Agents: []string{string(model.AgentPi)},
 	}, system.DetectionResult{})
@@ -130,7 +177,7 @@ func TestNormalizeInstallFlagsPiOnlyDefaultsToEngramOnly(t *testing.T) {
 	if !reflect.DeepEqual(input.Selection.Agents, wantAgents) {
 		t.Fatalf("agents = %#v, want %#v", input.Selection.Agents, wantAgents)
 	}
-	wantComponents := []model.ComponentID{model.ComponentEngram}
+	wantComponents := []model.ComponentID{model.ComponentEngram, model.ComponentPersona}
 	if !reflect.DeepEqual(input.Selection.Components, wantComponents) {
 		t.Fatalf("components = %#v, want %#v", input.Selection.Components, wantComponents)
 	}
